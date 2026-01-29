@@ -2,8 +2,7 @@
 DISCOVERY_PORT = 37020
 NODE_UDP_BASE = 37100
 
-# Backward-compat: node.py may import this symbol.
-# Actual runtime discovery uses cafeds.net.discovery_targets().
+# Default (will be overridden below)
 DISCOVERY_TARGETS = ["127.0.0.1", "255.255.255.255"]
 
 # ---- Timings ----
@@ -22,17 +21,24 @@ LOG_PREFIX = "[CafeDS]"
 
 
 # ---------------- CafeDS AUTO DISCOVERY (override) ----------------
-# Prefer Wi-Fi LAN (your case 192.168.1.x) instead of VirtualBox host-only (192.168.56.x)
+# Prefer the active LAN interface broadcast (works on multi-PC),
+# but keep localhost for single-PC tests.
+
 import socket as _socket
 
 def _cafeds_default_ipv4() -> str:
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     try:
-        # no traffic is actually sent; this just picks the default route interface
+        # no traffic actually sent; selects default route interface
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
     finally:
-        s.close()
+        try:
+            s.close()
+        except Exception:
+            pass
 
 def _cafeds_broadcast24(ip: str) -> str:
     parts = ip.split(".")
@@ -40,15 +46,14 @@ def _cafeds_broadcast24(ip: str) -> str:
         return ".".join(parts[:3] + ["255"])
     return "255.255.255.255"
 
-# force discovery to Wi-Fi / default route broadcast + keep localhost for single-PC tests
 try:
     _ip = _cafeds_default_ipv4()
-    if _ip.startswith("192.168.56."):
-        # if default route somehow points to VirtualBox, fallback to generic broadcast
+
+    # If we only have loopback/link-local, fallback to generic broadcast.
+    if _ip.startswith("127.") or _ip.startswith("169.254.") or _ip.startswith("0."):
         DISCOVERY_TARGETS = ["255.255.255.255", "127.0.0.1"]
     else:
-        DISCOVERY_TARGETS = [_cafeds_broadcast24(_ip), "127.0.0.1"]
+        DISCOVERY_TARGETS = [_cafeds_broadcast24(_ip), "255.255.255.255", "127.0.0.1"]
 except Exception:
     DISCOVERY_TARGETS = ["255.255.255.255", "127.0.0.1"]
 # ------------------------------------------------------------------
-

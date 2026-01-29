@@ -3,7 +3,7 @@ import time
 import socket
 import uuid
 from dataclasses import dataclass
-from typing import Optional, Set, Tuple, Dict, Any
+from typing import Optional, Set, Dict, Any
 
 from .config import (
     DISCOVERY_TARGETS, DISCOVERY_INTERVAL, HEARTBEAT_INTERVAL, LEADER_TIMEOUT,
@@ -39,12 +39,10 @@ class Node:
         self.tcp_port = tcp_port
         self.ui = ui
 
-        # UDP sockets:
-        # - node UDP (unique) always
+        # UDP sockets
         self.node_udp_port = NODE_UDP_BASE + node_id
         self.udp_node = make_udp_socket(self.node_udp_port)
 
-        # - discovery UDP (only when leader)
         self.udp_disc: Optional[socket.socket] = None
         if role == "leader":
             self.udp_disc = make_udp_socket(DISCOVERY_PORT)
@@ -69,17 +67,20 @@ class Node:
         # Total-order delivery (follower)
         self.expected_seq = 1
         self.buffer: Dict[int, Dict[str, Any]] = {}
-        self.delivered_seqs = set()      # dedup seqs delivered
-        self.delivery_lock = threading.Lock()  # protect expected_seq/buffer
-        self.last_resend_ts = 0.0        # resend rate-limit
-        self.in_election_since = 0.0     # prevent double-election spam
+        self.delivered_seqs = set()
+        self.delivery_lock = threading.Lock()
+        self.last_resend_ts = 0.0
 
         # election state
         self.in_election = False
+        self.in_election_since = 0.0
         self.answer_event = threading.Event()
         self.coordinator_event = threading.Event()
         self.coordinator_msg: Optional[Dict[str, Any]] = None
         self.election_lock = threading.Lock()
+
+        # leader heartbeat start guard
+        self._heartbeat_started = False
 
         # Threads
         self.threads: Set[threading.Thread] = set()
@@ -90,7 +91,6 @@ class Node:
     # ---------------- RUN ----------------
 
     def run(self) -> None:
-        # UDP listeners
         t1 = threading.Thread(target=self._udp_node_listener, daemon=True)
         t1.start()
         self.threads.add(t1)
@@ -100,7 +100,6 @@ class Node:
             t2.start()
             self.threads.add(t2)
 
-        # TCP init
         if self.role == "leader":
             self._start_tcp_leader()
             self._start_leader_heartbeat_thread()
@@ -111,14 +110,11 @@ class Node:
                 tw.start()
                 self.threads.add(tw)
 
-        # main follower discovery thread
         tf = threading.Thread(target=self._follower_discovery_loop, daemon=True)
         tf.start()
         self.threads.add(tf)
 
         self.log("Node is running.")
-
-        # keep process alive
         while not self.stop_event.is_set():
             time.sleep(0.5)
 
@@ -136,30 +132,51 @@ class Node:
             except Exception:
                 pass
 
-
     def _safe_start_election(self, reason: str = "") -> None:
-        # single-flight election starter (prevents epoch=2 then epoch=3 spam)
-        import time as _time
-        if getattr(self, "role", "") == "leader":
+        if self.role == "leader":
             return
-        now = _time.time()
+        now = time.time()
         with self.election_lock:
-            since = getattr(self, "in_election_since", 0.0)
-            if getattr(self, "in_election", False) and (now - since) < 2.0:
+            # single-flight: don't start another election if one started recently
+            if self.in_election and (now - self.in_election_since) < 2.0:
                 return
             self.in_election = True
             self.in_election_since = now
 
         if reason:
-            try: self.log(f"{reason} -> starting election")
-            except Exception: pass
+            self.log(f"{reason} -> starting election")
+        threading.Thread(target=self._bully_election, daemon=True).start()
 
-        import threading as _threading
-        th = _threading.Thread(target=self._bully_election, daemon=True)
-        th.start()
+    def _is_better_leader(self, new: LeaderInfo) -> bool:
+        cur = self.leader
+        if cur is None:
+            return True
 
-    def _process_order(self, msg) -> None:
-        # seq-based total-order delivery: dedup + in-order buffer + resend on gaps
+        # Prefer higher epoch
+        if new.epoch != cur.epoch:
+            return new.epoch > cur.epoch
+
+        # Prefer higher leader_id (bully style)
+        if new.leader_id != cur.leader_id:
+            return new.leader_id > cur.leader_id
+
+        # Same leader: prefer non-loopback over loopback
+        cur_loop = cur.leader_ip.startswith("127.")
+        new_loop = new.leader_ip.startswith("127.")
+        if cur_loop and not new_loop:
+            return True
+        if not cur_loop and new_loop:
+            return False
+
+        # Prefer larger last_seq if everything else equal
+        if new.last_seq != cur.last_seq:
+            return new.last_seq > cur.last_seq
+
+        return False
+
+    # ---------------- ORDER PROCESSING ----------------
+
+    def _process_order(self, msg: Dict[str, Any]) -> None:
         if not msg:
             return
         try:
@@ -170,12 +187,9 @@ class Node:
             return
 
         # keep history for leader handover
-        try:
-            with self.history_lock:
-                self.history[seq] = msg
-                self.last_seq = max(getattr(self, "last_seq", 0), seq)
-        except Exception:
-            pass
+        with self.history_lock:
+            self.history[seq] = msg
+            self.last_seq = max(self.last_seq, seq)
 
         with self.delivery_lock:
             # dedup
@@ -183,17 +197,16 @@ class Node:
                 self.delivered_seqs.add(seq)
                 return
 
-            # gap => buffer + ask resend
+            # gap => buffer + resend request
             if seq > self.expected_seq:
                 self.buffer[seq] = msg
-                import time as _time
-                now = _time.time()
-                if getattr(self, "tcp_client", None) and getattr(self, "tcp_connected", False) and (now - self.last_resend_ts) >= 0.5:
+                now = time.time()
+                if self.tcp_client and self.tcp_connected and (now - self.last_resend_ts) >= 0.5:
                     self.last_resend_ts = now
                     try:
-                        req = resend_request(self.expected_seq)  # if exists
+                        req = resend_request(self.expected_seq)
                     except Exception:
-                        req = {"type":"RESEND_REQUEST","sender_id":getattr(self,"node_id",0),"from_seq":self.expected_seq}
+                        req = {"type": "RESEND_REQUEST", "sender_id": self.node_id, "from_seq": self.expected_seq}
                     try:
                         self.tcp_client.send(req)
                         self.log(f"RESEND_REQUEST sent from_seq={self.expected_seq}")
@@ -226,91 +239,75 @@ class Node:
                 msg = decode(data)
                 mtype = msg.get("type")
 
-                # ---- FIX: Leader discovery / heartbeat ----
                 if mtype == "I_AM_LEADER" and self.role == "follower":
-                    # MULTI_NIC_FIX: always use the real sender IP (works across different PCs)
-                    try:
-                        leader_ip = addr[0]
-                    except Exception:
-                        pass
-
-                    new_id = int(msg.get("leader_id", -1))
-                    new_ip = str(msg.get("leader_ip", "127.0.0.1"))
-                    new_tcp = int(msg.get("leader_tcp_port", 0))
-                    new_epoch = int(msg.get("epoch", 1))
-                    new_last = int(msg.get("last_seq", 0))
-                    self.leader = LeaderInfo(
-                        leader_id=new_id,
-                        leader_ip=new_ip,
-                        leader_tcp_port=new_tcp,
-                        epoch=new_epoch,
-                        last_seq=new_last,
+                    new = LeaderInfo(
+                        leader_id=int(msg.get("leader_id", -1)),
+                        leader_ip=src_ip,  # IMPORTANT: use real sender IP (multi-PC safe)
+                        leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
+                        epoch=int(msg.get("epoch", 1)),
+                        last_seq=int(msg.get("last_seq", 0)),
                         last_seen_ts=time.time(),
                     )
-                    self.epoch = max(self.epoch, new_epoch)
-                    self.log(f"Leader discovered: {new_id} @ {new_ip}:{new_tcp} (epoch={new_epoch})")
+
+                    if self._is_better_leader(new):
+                        self.leader = new
+                        self.epoch = max(self.epoch, new.epoch)
+                        self.log(f"Leader discovered: {new.leader_id} @ {new.leader_ip}:{new.leader_tcp_port} (epoch={new.epoch})")
 
                 elif mtype == "LEADER_ALIVE" and self.role == "follower":
                     lid = int(msg.get("leader_id", -1))
                     e = int(msg.get("epoch", 1))
                     ls = int(msg.get("last_seq", 0))
-                    if self.leader is None or self.leader.leader_id == lid:
-                        if self.leader is None:
-                            self.leader = LeaderInfo(
-                                leader_id=lid,
-                                leader_ip=local_ip_for_peer(src_ip),
-                                leader_tcp_port=0,
-                                epoch=e,
-                                last_seq=ls,
-                                last_seen_ts=time.time(),
-                            )
-                        else:
+
+                    # If leader unknown, accept heartbeat as "someone exists" (tcp_port unknown yet)
+                    if self.leader is None:
+                        self.leader = LeaderInfo(
+                            leader_id=lid,
+                            leader_ip=src_ip,
+                            leader_tcp_port=0,
+                            epoch=e,
+                            last_seq=ls,
+                            last_seen_ts=time.time(),
+                        )
+                    else:
+                        # only refresh if same leader or higher epoch
+                        if lid == self.leader.leader_id or e > self.leader.epoch:
                             self.leader.last_seen_ts = time.time()
                             self.leader.epoch = max(self.leader.epoch, e)
                             self.leader.last_seq = max(self.leader.last_seq, ls)
-                        self.epoch = max(self.epoch, e)
-
+                    self.epoch = max(self.epoch, e)
 
                 if mtype == "ELECTION":
                     cand = int(msg.get("candidate_id", -1))
                     e = int(msg.get("epoch", 1))
                     if self.node_id > cand:
-                        # Reply ANSWER to candidate's node port
                         try:
                             send_udp(self.udp_node, encode(answer(self.node_id, max(self.epoch, e))), src_ip, src_port)
                         except Exception:
                             pass
-                        # Bully: higher node should also start election
-                        self._maybe_start_election_async()
+                        # higher node should also start its own election
+                        self._safe_start_election("Received ELECTION from lower node")
 
                 elif mtype == "ANSWER":
                     self.answer_event.set()
 
                 elif mtype == "COORDINATOR":
-
-                    # MULTI_NIC_FIX: always use the real sender IP (works across different PCs)
-
-                    try:
-
-                        leader_ip = addr[0]
-
-                    except Exception:
-
-                        pass
-
+                    # save coordinator msg for election thread
                     self.coordinator_msg = msg
                     self.coordinator_event.set()
-                    # If I'm leader but see higher epoch coordinator, step down
+
                     lead_id = int(msg.get("leader_id", -1))
                     e = int(msg.get("epoch", 1))
+
+                    # If I'm leader but see higher epoch coordinator, step down
                     if self.role == "leader" and lead_id != self.node_id and e >= self.epoch:
                         self.log(f"Stepping down: coordinator {lead_id} epoch={e}")
                         self._demote_to_follower(LeaderInfo(
                             leader_id=lead_id,
-                            leader_ip=str(msg.get('leader_ip','127.0.0.1')),
-                            leader_tcp_port=int(msg.get('leader_tcp_port',0)),
+                            leader_ip=src_ip,  # real sender IP
+                            leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
                             epoch=e,
-                            last_seq=int(msg.get('last_seq',0)),
+                            last_seq=int(msg.get("last_seq", 0)),
                             last_seen_ts=time.time()
                         ))
 
@@ -356,40 +353,17 @@ class Node:
 
             now = time.time()
 
-            # TCP connected => refresh leader last_seen_ts (prevents election spam)
+            # if TCP connected, treat leader as seen (prevents flapping)
             with self.tcp_lock:
                 tcp_ok = self.tcp_connected
             if self.leader and tcp_ok:
                 self.leader.last_seen_ts = now
 
-
             # leader timeout?
             if self.leader and (now - self.leader.last_seen_ts) > LEADER_TIMEOUT:
-                with self.election_lock:
-                    already = self.in_election
-                if not already:
-                    # already electing? ignore duplicate trigger
-                    with self.election_lock:
-                        if getattr(self, 'in_election', False):
-                            continue
-                    with self.election_lock:
-                        if getattr(self, "in_election", False):
-                            continue
-                    self.log("Leader timeout -> starting election")
-                    threading.Thread(target=self._bully_election, daemon=True).start()
-                    self.leader = None
-                    self._close_tcp_client()
-                    self._safe_start_election('')
-
-                # already electing? ignore duplicate trigger
-                with self.election_lock:
-                    if getattr(self, 'in_election', False):
-                        continue
-                self.log("Leader timeout -> starting election")
-                threading.Thread(target=self._bully_election, daemon=True).start()
-                self.leader = None
                 self._close_tcp_client()
-                self._safe_start_election('')
+                self.leader = None
+                self._safe_start_election("Leader timeout")
 
             # If leader unknown: ask via discovery port
             if self.leader is None and not self.in_election:
@@ -434,7 +408,8 @@ class Node:
             elif mtype == "RESEND_REQUEST":
                 from_seq = int(msg.get("from_seq", 1))
                 with self.history_lock:
-                    for s in range(from_seq, max(self.history.keys(), default=0) + 1):
+                    hi = max(self.history.keys(), default=0)
+                    for s in range(from_seq, hi + 1):
                         if s in self.history:
                             conn.send(self.history[s])
 
@@ -442,6 +417,9 @@ class Node:
         self.tcp_server.start()
 
     def _start_leader_heartbeat_thread(self) -> None:
+        if self._heartbeat_started:
+            return
+        self._heartbeat_started = True
         t = threading.Thread(target=self._leader_heartbeat_loop, daemon=True)
         t.start()
         self.threads.add(t)
@@ -452,7 +430,6 @@ class Node:
                 time.sleep(0.5)
                 continue
 
-            # heartbeat to all cluster nodes (robust after election)
             with self.history_lock:
                 self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
 
@@ -472,15 +449,9 @@ class Node:
     def _start_tcp_follower(self) -> None:
         def on_msg(msg: Dict[str, Any]) -> None:
             if msg.get("type") == "ORDER":
-                self._process_order(locals().get('msg') or locals().get('m') or locals().get('message'))
-                return
-                self._handle_order(msg)
-            elif msg.get("type") == "I_AM_LEADER":
-                # not used on TCP
-                pass
+                self._process_order(msg)
 
         def on_log(s: str) -> None:
-            # if disconnected, mark not connected
             if "disconnected" in s.lower() or "stopped" in s.lower():
                 with self.tcp_lock:
                     self.tcp_connected = False
@@ -505,8 +476,10 @@ class Node:
             self.tcp_connected = ok
 
         if ok:
-            # catch-up
-            self.tcp_client.send(resend_request(self.expected_seq))
+            try:
+                self.tcp_client.send(resend_request(self.expected_seq))
+            except Exception:
+                pass
 
     def _close_tcp_client(self) -> None:
         with self.tcp_lock:
@@ -516,42 +489,9 @@ class Node:
 
     # ---------------- DELIVERY ----------------
 
-    def _handle_order(self, msg: Dict[str, Any]) -> None:
-        seq = int(msg.get("seq", -1))
-        if seq <= 0:
-            return
-
-        # store in local history (so any node can become leader)
-        with self.history_lock:
-            self.history[seq] = msg
-            self.last_seq = max(self.last_seq, seq)
-
-        if seq < self.expected_seq:
-            return
-
-        if seq > self.expected_seq:
-            self.buffer[seq] = msg
-            if self.tcp_client:
-                self.tcp_client.send(resend_request(self.expected_seq))
-            return
-
-        self._deliver(msg)
-        self.expected_seq += 1
-
-        while self.expected_seq in self.buffer:
-            m = self.buffer.pop(self.expected_seq)
-            self._deliver(m)
-            self.expected_seq += 1
-
     def _deliver(self, msg: Dict[str, Any]) -> None:
         payload = msg.get("payload", {})
         text = payload.get("text", str(payload))
-        # DEDUP_GUARD: prevent duplicate delivery after reconnect
-        try:
-            if int(seq) <= int(getattr(self, 'last_seq', 0)):
-                return
-        except Exception:
-            pass
         self.log(f"DELIVER seq={msg.get('seq')} | {text}")
 
     # ---------------- WAITER INPUT ----------------
@@ -569,7 +509,7 @@ class Node:
             self.submit_order({"text": line})
 
     def submit_order(self, payload: Dict[str, Any]) -> None:
-        # If I'm leader, accept local orders (demo-friendly) and broadcast directly
+        # If I'm leader, accept local orders (demo-friendly)
         if self.role == "leader":
             oid = str(uuid.uuid4())
             with self.history_lock:
@@ -581,11 +521,9 @@ class Node:
             self.log(f"LOCAL_ORDER -> seq={seq} (broadcast ORDER)")
             if self.tcp_server:
                 self.tcp_server.broadcast(om)
-            # also show locally
             self._deliver(om)
             return
 
-        # follower path: send NEW_ORDER to leader
         if not self.tcp_client:
             self.log("Cannot submit order: tcp_client missing")
             return
@@ -600,63 +538,32 @@ class Node:
 
     # ---------------- BULLY ELECTION ----------------
 
-    def _maybe_start_election_async(self) -> None:
-        # Start election in background if not already
-        with self.election_lock:
-            if self.in_election or self.role != "follower":
-                return
-            self.in_election = True
-        t = threading.Thread(target=self._bully_election, daemon=True)
-        t.start()
-        self.threads.add(t)
-
     def _bully_election(self) -> None:
-        # SINGLE_FLIGHT_ELECTION_GUARD
-        import time as _time
-        now = _time.time()
-        with self.election_lock:
-            since = getattr(self, 'in_election_since', 0.0)
-            if getattr(self, 'in_election', False) and (now - since) < 3.0:
-                return
-            self.in_election = True
-            self.in_election_since = now
-
-        with self.election_lock:
-            if self.in_election:
-                # already in election
-                pass
-            else:
-                self.in_election = True
-
+        # IMPORTANT: no extra guard here (starter already guarded)
         self.answer_event.clear()
         self.coordinator_event.clear()
         self.coordinator_msg = None
 
-        # propose new epoch
         proposed_epoch = self.epoch + 1
-
         higher = [nid for nid in CLUSTER_NODE_IDS if nid > self.node_id]
         self.log(f"Election started. higher={higher}")
 
-        # send ELECTION to higher nodes
         for nid in higher:
             try:
                 self._send_to_node(nid, election(self.node_id, proposed_epoch))
             except Exception:
                 pass
 
-        # wait for ANSWER
         got_answer = self.answer_event.wait(ELECTION_ANSWER_TIMEOUT)
 
         if not got_answer:
-            # I am the coordinator
             self.log("No ANSWER -> I become LEADER")
             self._promote_to_leader(new_epoch=proposed_epoch)
             with self.election_lock:
                 self.in_election = False
+                self.in_election_since = 0.0
             return
 
-        # someone higher is alive -> wait coordinator
         self.log("Got ANSWER -> waiting for COORDINATOR")
         got_coord = self.coordinator_event.wait(COORDINATOR_TIMEOUT)
 
@@ -664,13 +571,13 @@ class Node:
             self.log("Coordinator timeout -> retry election")
             with self.election_lock:
                 self.in_election = False
+                self.in_election_since = 0.0
             return
 
-        # accept coordinator
         msg = self.coordinator_msg
         lead = LeaderInfo(
             leader_id=int(msg["leader_id"]),
-            leader_ip=str(msg.get("leader_ip", "127.0.0.1")),
+            leader_ip=str(msg.get("leader_ip", "")) or "127.0.0.1",
             leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
             epoch=int(msg.get("epoch", proposed_epoch)),
             last_seq=int(msg.get("last_seq", 0)),
@@ -679,28 +586,19 @@ class Node:
         self.epoch = max(self.epoch, lead.epoch)
         self.leader = lead
         self.log(f"COORDINATOR is {lead.leader_id} @ {lead.leader_ip}:{lead.leader_tcp_port} epoch={lead.epoch}")
-        with self.election_lock:
-            self.in_election = False
-        self.in_election_since = 0.0
-        # reset election on coordinator
-        with self.election_lock:
-            self.in_election = False
-        self.in_election_since = 0.0
 
         with self.election_lock:
             self.in_election = False
+            self.in_election_since = 0.0
 
         self._ensure_tcp_connected()
 
     def _promote_to_leader(self, new_epoch: int) -> None:
-        # close follower tcp
         self._close_tcp_client()
-
-        # stop being follower
         self.role = "leader"
+        self.leader = None
         self.epoch = max(self.epoch + 1, new_epoch)
 
-        # ensure discovery socket exists (bind 37020)
         if self.udp_disc is None:
             try:
                 self.udp_disc = make_udp_socket(DISCOVERY_PORT)
@@ -710,15 +608,15 @@ class Node:
             except Exception as e:
                 self.log(f"Failed to bind discovery port: {e}")
 
-        # start TCP server if not running
         if self.tcp_server is None:
             self._start_tcp_leader()
 
-        # update last_seq from local history
+        # start periodic heartbeat AFTER promotion
+        self._start_leader_heartbeat_thread()
+
         with self.history_lock:
             self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
 
-        # announce coordinator to cluster
         msg = coordinator(self.node_id, primary_ip(), self.tcp_port, self.epoch, self.last_seq)
         for nid in CLUSTER_NODE_IDS:
             if nid == self.node_id:
@@ -730,19 +628,11 @@ class Node:
 
         self.log(f"Announced COORDINATOR epoch={self.epoch} last_seq={self.last_seq}")
 
-        # reset election state after becoming leader
-
-        with self.election_lock:
-
-            self.in_election = False
-
-        self.in_election_since = 0.0
     def _demote_to_follower(self, new_leader: LeaderInfo) -> None:
         if self.role != "leader":
             self.leader = new_leader
             return
 
-        # stop server
         if self.tcp_server:
             self.tcp_server.stop()
             self.tcp_server = None
