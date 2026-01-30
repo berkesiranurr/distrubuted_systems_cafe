@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Byte-compiled files
+*.pyc
+
+# Temporary files
+*.tmp
+*.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Extracted text files (generated)
+*_text.txt
