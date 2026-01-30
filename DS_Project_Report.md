@@ -240,24 +240,29 @@ The kitchen queue must be **identical on all screens**. When two waiters submit 
 
 ## Missing/Incomplete Areas to Fix
 
-> [!WARNING]
-> The following items are mentioned in the proposal but may need review or completion:
+> [!NOTE]
+> The following items have been reviewed and updated:
 
 ### 1. Write-Ahead Log (WAL)
 - **Proposal**: "Optionally, the Leader writes each accepted order to a WAL before acknowledging"
-- **Current Code**: ❌ **Not implemented** - Orders are stored in memory (`self.history`) but not persisted to disk
-- **Impact**: If Leader crashes and restarts, all orders are lost unless state reconstruction happens from other nodes
+- **Current Code**: ✅ **IMPLEMENTED** - Orders are persisted to disk via `_append_to_wal()` before broadcasting
+- **Config**: `WAL_ENABLED = True`, `WAL_FILE = "cafeds_wal_node_{node_id}.jsonl"`
+- **Recovery**: `_recover_from_wal()` restores history on startup
 
 ### 2. Order UUID Deduplication
 - **Proposal**: "Uses unique order_uuid to deduplicate resends after reconnect"
-- **Current Code**: ⚠️ **Partially implemented** - `order_uuid` is generated and transmitted, but no deduplication check exists in `_start_tcp_leader()`
-- **Recommendation**: Add check `if order_uuid in seen_uuids: return` before processing `NEW_ORDER`
+- **Current Code**: ✅ **IMPLEMENTED** - `seen_order_uuids` set tracks processed UUIDs in `_start_tcp_leader()`
+- **Behavior**: Duplicate orders are logged and ignored
 
-### 3. GitHub/GitLab Repository URL
+### 3. Omission Fault Tolerance
+- **Current Code**: ✅ **IMPLEMENTED** - Heartbeats sent multiple times per interval (`HEARTBEAT_REDUNDANCY = 2`)
+- **Benefit**: Reduces false leader-timeout elections due to UDP packet loss
+
+### 4. GitHub/GitLab Repository URL
 - **Report Form**: Requires repository URL
-- **Current Status**: ❓ **Unknown** - Please add your repository URL to the report
+- **Current Status**: ❓ **Pending** - Please add your repository URL to the report
 
-### 4. System Architecture Diagram
+### 5. System Architecture Diagram
 - **Report Form**: "Include a clear diagram of your system architecture"
 - **Recommendation**: Create a visual diagram (draw.io, Lucidchart, or hand-drawn) showing the components and connections. The ASCII diagram above can be used as reference.
 

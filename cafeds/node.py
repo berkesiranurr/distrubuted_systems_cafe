@@ -2,13 +2,16 @@ import threading
 import time
 import socket
 import uuid
+import os
+import json
 from dataclasses import dataclass
 from typing import Optional, Set, Dict, Any
 
 from .config import (
     DISCOVERY_TARGETS, DISCOVERY_INTERVAL, HEARTBEAT_INTERVAL, LEADER_TIMEOUT,
     LOG_PREFIX, DISCOVERY_PORT, NODE_UDP_BASE,
-    ELECTION_ANSWER_TIMEOUT, COORDINATOR_TIMEOUT, CLUSTER_NODE_IDS
+    ELECTION_ANSWER_TIMEOUT, COORDINATOR_TIMEOUT, CLUSTER_NODE_IDS,
+    WAL_ENABLED, WAL_FILE, HEARTBEAT_REDUNDANCY
 )
 from .udp_bus import make_udp_socket, send_udp, recv_udp
 from .proto import (
@@ -82,11 +85,62 @@ class Node:
         # leader heartbeat start guard
         self._heartbeat_started = False
 
+        # UUID deduplication for orders (prevents duplicate processing)
+        self.seen_order_uuids: Set[str] = set()
+        self.seen_uuids_lock = threading.Lock()
+
+        # WAL (Write-Ahead Log) for persistence
+        self.wal_file = WAL_FILE.format(node_id=node_id) if WAL_ENABLED else None
+        if self.wal_file:
+            self._recover_from_wal()
+
         # Threads
         self.threads: Set[threading.Thread] = set()
 
     def log(self, msg: str) -> None:
         print(f"{LOG_PREFIX} [id={self.node_id} role={self.role} udp_node={self.node_udp_port}] {msg}", flush=True)
+
+    # ---------------- WAL (Write-Ahead Log) ----------------
+
+    def _append_to_wal(self, order: Dict[str, Any]) -> None:
+        """Persist order to disk before acknowledging (crash durability)."""
+        if not self.wal_file:
+            return
+        try:
+            with open(self.wal_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(order, separators=(",", ":")) + "\n")
+                f.flush()
+                os.fsync(f.fileno())  # Ensure durably written to disk
+        except Exception as e:
+            self.log(f"WAL write error: {e}")
+
+    def _recover_from_wal(self) -> None:
+        """Recover order history from WAL on startup."""
+        if not self.wal_file or not os.path.exists(self.wal_file):
+            return
+        recovered = 0
+        try:
+            with open(self.wal_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        order = json.loads(line)
+                        seq = int(order.get("seq", 0))
+                        order_uuid = str(order.get("order_uuid", ""))
+                        if seq > 0:
+                            self.history[seq] = order
+                            self.last_seq = max(self.last_seq, seq)
+                            if order_uuid:
+                                self.seen_order_uuids.add(order_uuid)
+                            recovered += 1
+                    except Exception:
+                        pass
+            if recovered > 0:
+                self.log(f"WAL recovered {recovered} orders, last_seq={self.last_seq}")
+        except Exception as e:
+            self.log(f"WAL recovery error: {e}")
 
     # ---------------- RUN ----------------
 
@@ -388,6 +442,16 @@ class Node:
             mtype = msg.get("type")
 
             if mtype == "NEW_ORDER":
+                order_uuid = str(msg.get("order_uuid", ""))
+
+                # UUID Deduplication: prevent duplicate order processing
+                with self.seen_uuids_lock:
+                    if order_uuid and order_uuid in self.seen_order_uuids:
+                        self.log(f"Duplicate order ignored: {order_uuid}")
+                        return
+                    if order_uuid:
+                        self.seen_order_uuids.add(order_uuid)
+
                 with self.history_lock:
                     self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
                     self.last_seq += 1
@@ -396,10 +460,13 @@ class Node:
                         leader_id=self.node_id,
                         epoch=self.epoch,
                         seq=seq,
-                        order_uuid=str(msg.get("order_uuid")),
+                        order_uuid=order_uuid,
                         payload=dict(msg.get("payload", {})),
                     )
                     self.history[seq] = om
+
+                # WAL: persist to disk BEFORE broadcasting (crash durability)
+                self._append_to_wal(om)
 
                 self.log(f"NEW_ORDER -> seq={seq} (broadcast ORDER)")
                 assert self.tcp_server is not None
@@ -434,13 +501,17 @@ class Node:
                 self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
 
             hb = leader_alive(self.node_id, self.epoch, self.last_seq)
-            for nid in CLUSTER_NODE_IDS:
-                if nid == self.node_id:
-                    continue
-                try:
-                    self._send_to_node(nid, hb)
-                except Exception:
-                    pass
+            
+            # Omission Fault Tolerance: send heartbeat multiple times
+            # This reduces the chance of election due to dropped UDP packets
+            for _ in range(HEARTBEAT_REDUNDANCY):
+                for nid in CLUSTER_NODE_IDS:
+                    if nid == self.node_id:
+                        continue
+                    try:
+                        self._send_to_node(nid, hb)
+                    except Exception:
+                        pass
 
             time.sleep(HEARTBEAT_INTERVAL)
 
