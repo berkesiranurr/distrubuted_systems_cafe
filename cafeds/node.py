@@ -82,8 +82,9 @@ class Node:
         # leader heartbeat start guard
         self._heartbeat_started = False
 
-        # Threads
+        # threads
         self.threads: Set[threading.Thread] = set()
+        self.seen_uuids: Set[str] = set()
 
     def log(self, msg: str) -> None:
         print(f"{LOG_PREFIX} [id={self.node_id} role={self.role} udp_node={self.node_udp_port}] {msg}", flush=True)
@@ -388,7 +389,12 @@ class Node:
             mtype = msg.get("type")
 
             if mtype == "NEW_ORDER":
+                order_uuid = str(msg.get("order_uuid", ""))
                 with self.history_lock:
+                    if order_uuid in self.seen_uuids:
+                        return
+                    self.seen_uuids.add(order_uuid)
+
                     self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
                     self.last_seq += 1
                     seq = self.last_seq
@@ -396,12 +402,14 @@ class Node:
                         leader_id=self.node_id,
                         epoch=self.epoch,
                         seq=seq,
-                        order_uuid=str(msg.get("order_uuid")),
+                        order_uuid=order_uuid,
                         payload=dict(msg.get("payload", {})),
                     )
+                    om["sender_id"] = msg.get("sender_id")
                     self.history[seq] = om
 
                 self.log(f"NEW_ORDER -> seq={seq} (broadcast ORDER)")
+                self._process_order(om)
                 assert self.tcp_server is not None
                 self.tcp_server.broadcast(om)
 
@@ -492,7 +500,8 @@ class Node:
     def _deliver(self, msg: Dict[str, Any]) -> None:
         payload = msg.get("payload", {})
         text = payload.get("text", str(payload))
-        self.log(f"DELIVER seq={msg.get('seq')} | {text}")
+        sender = msg.get("sender_id", "unknown")
+        self.log(f"DELIVER seq={msg.get('seq')} [from={sender}] | {text}")
 
     # ---------------- WAITER INPUT ----------------
 
@@ -517,6 +526,7 @@ class Node:
                 self.last_seq += 1
                 seq = self.last_seq
                 om = order_msg(self.node_id, self.epoch, seq, oid, payload)
+                om["sender_id"] = self.node_id
                 self.history[seq] = om
             self.log(f"LOCAL_ORDER -> seq={seq} (broadcast ORDER)")
             if self.tcp_server:
