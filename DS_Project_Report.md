@@ -15,7 +15,7 @@
 | **3. Student Name** | Emre Erisen |
 | **4. Student Name** | Junichi Nagasawa |
 | **Project Title** | CaféDS: Distributed Order & Kitchen Display System |
-| **GitHub/GitLab URL** | *(Add your repository URL here)* |
+| **GitHub/GitLab URL** | https://github.com/berkesiranurr/distrubuted_systems_cafe |
 
 ---
 
