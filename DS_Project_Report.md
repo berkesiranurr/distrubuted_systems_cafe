@@ -13,9 +13,9 @@
 | **1. Student Name** | Hakan Berke Siranur |
 | **2. Student Name** | Berkay Cagri Soylu |
 | **3. Student Name** | Emre Erisen |
-| **4. Student Name** | *(leave blank if only 3 members)* |
+| **4. Student Name** | Junichi Nagasawa |
 | **Project Title** | CaféDS: Distributed Order & Kitchen Display System |
-| **GitHub/GitLab URL** | *(Add your repository URL here)* |
+| **GitHub/GitLab URL** | https://github.com/berkesiranurr/distrubuted_systems_cafe |
 
 ---
 
@@ -251,8 +251,8 @@ The kitchen queue must be **identical on all screens**. When two waiters submit 
 
 ### 2. Order UUID Deduplication
 - **Proposal**: "Uses unique order_uuid to deduplicate resends after reconnect"
-- **Current Code**: ✅ **IMPLEMENTED** - `seen_order_uuids` set tracks processed UUIDs in `_start_tcp_leader()`
-- **Behavior**: Duplicate orders are logged and ignored
+- **Current Code**: ✅ **IMPLEMENTED** - The Leader tracks `seen_order_uuids` and ignores any duplicate `order_uuid` received from clients.
+- **Behavior**: Duplicate orders are logged and ignored to prevent double delivery.
 
 ### 3. Omission Fault Tolerance
 - **Current Code**: ✅ **IMPLEMENTED** - Heartbeats sent multiple times per interval (`HEARTBEAT_REDUNDANCY = 2`)
@@ -260,7 +260,7 @@ The kitchen queue must be **identical on all screens**. When two waiters submit 
 
 ### 4. GitHub/GitLab Repository URL
 - **Report Form**: Requires repository URL
-- **Current Status**: ❓ **Pending** - Please add your repository URL to the report
+- **Current Status**: ✅ **UPDATED** - Repository URL added to the Project Information section.
 
 ### 5. System Architecture Diagram
 - **Report Form**: "Include a clear diagram of your system architecture"
@@ -582,10 +582,9 @@ def _process_order(self, msg: Dict) -> None:
 
 | # | Fix | File to Edit | What to Do | Why It Matters |
 |---|-----|--------------|------------|----------------|
-| 1 | **UUID Deduplication** | `node.py` | Add `self.seen_order_uuids: Set[str] = set()` in `__init__`, then in `_start_tcp_leader()` check `if order_uuid in self.seen_order_uuids: return` before processing NEW_ORDER | Prevents duplicate orders when client retries after timeout |
-| 2 | **Architecture Diagram** | PDF Report | Convert the ASCII diagram in this doc to a visual diagram using draw.io, Lucidchart, or Canva | Report form explicitly requires a diagram |
-| 3 | **GitHub URL** | PDF Report | Add your repository URL to the Project Information section | Required field in report form |
-| 4 | **WAL Persistence** *(Optional)* | `node.py` | Add `_append_to_wal()` and `_recover_from_wal()` methods, call append before broadcasting ORDER | Mentioned in proposal as "optional", provides crash durability |
+| 1 | **Architecture Diagram** | PDF Report | Convert the ASCII diagram in this doc to a visual diagram using draw.io, Lucidchart, or Canva | Report form explicitly requires a diagram |
+| 2 | **GitHub URL** | PDF Report | Add your repository URL to the Project Information section | Required field in report form |
+| 3 | **WAL Persistence** *(Optional)* | `node.py` | Add `_append_to_wal()` and `_recover_from_wal()` methods, call append before broadcasting ORDER | Mentioned in proposal as "optional", provides crash durability |
 
 ### What You DON'T Need to Fix
 

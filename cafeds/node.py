@@ -78,13 +78,6 @@ class Node:
         self.in_election = False
         self.in_election_since = 0.0
         self.answer_event = threading.Event()
-        self.coordinator_event = threading.Event()
-        self.coordinator_msg: Optional[Dict[str, Any]] = None
-        self.election_lock = threading.Lock()
-
-        # leader heartbeat start guard
-        self._heartbeat_started = False
-
         # UUID deduplication for orders (prevents duplicate processing)
         self.seen_order_uuids: Set[str] = set()
         self.seen_uuids_lock = threading.Lock()
@@ -96,6 +89,14 @@ class Node:
 
         # Threads
         self.threads: Set[threading.Thread] = set()
+
+        self.coordinator_event = threading.Event()
+        self.coordinator_msg: Optional[Dict[str, Any]] = None
+        self.election_lock = threading.Lock()
+
+        # leader heartbeat start guard
+        self._heartbeat_started = False
+
 
     def log(self, msg: str) -> None:
         print(f"{LOG_PREFIX} [id={self.node_id} role={self.role} udp_node={self.node_udp_port}] {msg}", flush=True)
@@ -137,8 +138,11 @@ class Node:
                             recovered += 1
                     except Exception:
                         pass
-            if recovered > 0:
                 self.log(f"WAL recovered {recovered} orders, last_seq={self.last_seq}")
+                # Update the next expected sequence number so that new orders can be delivered.
+                with self.delivery_lock:
+                    self.expected_seq = self.last_seq + 1
+                    self.delivered_seqs.update(range(1, self.expected_seq))
         except Exception as e:
             self.log(f"WAL recovery error: {e}")
 
@@ -443,7 +447,6 @@ class Node:
 
             if mtype == "NEW_ORDER":
                 order_uuid = str(msg.get("order_uuid", ""))
-
                 # UUID Deduplication: prevent duplicate order processing
                 with self.seen_uuids_lock:
                     if order_uuid and order_uuid in self.seen_order_uuids:
@@ -463,12 +466,14 @@ class Node:
                         order_uuid=order_uuid,
                         payload=dict(msg.get("payload", {})),
                     )
+                    om["sender_id"] = msg.get("sender_id")
                     self.history[seq] = om
 
                 # WAL: persist to disk BEFORE broadcasting (crash durability)
                 self._append_to_wal(om)
 
                 self.log(f"NEW_ORDER -> seq={seq} (broadcast ORDER)")
+                self._process_order(om) # これでキッチンに表示されます
                 assert self.tcp_server is not None
                 self.tcp_server.broadcast(om)
 
@@ -563,7 +568,8 @@ class Node:
     def _deliver(self, msg: Dict[str, Any]) -> None:
         payload = msg.get("payload", {})
         text = payload.get("text", str(payload))
-        self.log(f"DELIVER seq={msg.get('seq')} | {text}")
+        sender = msg.get("sender_id", "unknown")
+        self.log(f"DELIVER seq={msg.get('seq')} [from={sender}] | {text}")
 
     # ---------------- WAITER INPUT ----------------
 
@@ -588,11 +594,12 @@ class Node:
                 self.last_seq += 1
                 seq = self.last_seq
                 om = order_msg(self.node_id, self.epoch, seq, oid, payload)
+                om["sender_id"] = self.node_id
                 self.history[seq] = om
             self.log(f"LOCAL_ORDER -> seq={seq} (broadcast ORDER)")
+            self._process_order(om) 
             if self.tcp_server:
                 self.tcp_server.broadcast(om)
-            self._deliver(om)
             return
 
         if not self.tcp_client:
@@ -687,6 +694,10 @@ class Node:
 
         with self.history_lock:
             self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
+            # Update the next expected sequence number so that new orders can be delivered.
+            with self.delivery_lock:
+                self.expected_seq = max(self.expected_seq, self.last_seq + 1)
+                self.delivered_seqs.update(range(1, self.expected_seq))
 
         msg = coordinator(self.node_id, primary_ip(), self.tcp_port, self.epoch, self.last_seq)
         for nid in CLUSTER_NODE_IDS:
