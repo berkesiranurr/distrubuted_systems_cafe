@@ -450,12 +450,6 @@ class Node:
 
             now = time.time()
 
-            # if TCP connected, treat leader as seen (prevents flapping)
-            with self.tcp_lock:
-                tcp_ok = self.tcp_connected
-            if self.leader and tcp_ok:
-                self.leader.last_seen_ts = now
-
             # leader timeout?
             if self.leader and (now - self.leader.last_seen_ts) > LEADER_TIMEOUT:
                 self._close_tcp_client()
