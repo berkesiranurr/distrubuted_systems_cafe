@@ -19,6 +19,16 @@ CLUSTER_NODE_IDS = [2, 3, 10]
 # ---- Logging ----
 LOG_PREFIX = "[CafeDS]"
 
+# ---- WAL (Write-Ahead Log) Persistence ----
+# Enable/disable WAL (set to False to disable disk persistence)
+WAL_ENABLED = True
+# WAL file path pattern ({node_id} will be replaced with actual node ID)
+WAL_FILE = "cafeds_wal_node_{node_id}.jsonl"
+
+# ---- Omission Fault Tolerance ----
+# Number of times to send each heartbeat (reduces false elections from packet loss)
+HEARTBEAT_REDUNDANCY = 2
+
 
 # ---------------- CafeDS AUTO DISCOVERY (final) ----------------
 # Multi-PC default:

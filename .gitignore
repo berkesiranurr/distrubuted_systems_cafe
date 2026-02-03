@@ -22,3 +22,6 @@ __pycache__/
 
 # Extracted text files (generated)
 *_text.txt
+
+# WAL (Write-Ahead Log) files
+cafeds_wal_*.jsonl
