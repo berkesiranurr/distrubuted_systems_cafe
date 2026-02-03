@@ -3,6 +3,7 @@ import time
 
 from cafeds.node import Node
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--id", type=int, required=True)
@@ -23,6 +24,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping...")
         node.stop()
+
 
 if __name__ == "__main__":
     main()

@@ -41,6 +41,7 @@ HEARTBEAT_REDUNDANCY = 2
 import os as _os
 import socket as _socket
 
+
 def _cafeds_default_ipv4() -> str:
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
     try:
@@ -55,11 +56,13 @@ def _cafeds_default_ipv4() -> str:
         except Exception:
             pass
 
+
 def _cafeds_broadcast24(ip: str) -> str:
     parts = ip.split(".")
     if len(parts) == 4:
         return ".".join(parts[:3] + ["255"])
     return "255.255.255.255"
+
 
 # Build discovery targets
 _ip = _cafeds_default_ipv4()
@@ -73,7 +76,13 @@ if not (_ip.startswith("127.") or _ip.startswith("169.254.") or _ip.startswith("
 targets.append("255.255.255.255")
 
 # Single-PC mode: allow localhost discovery explicitly
-if _os.environ.get("CAFEDS_SINGLE_PC", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
+if _os.environ.get("CAFEDS_SINGLE_PC", "").strip() in (
+    "1",
+    "true",
+    "TRUE",
+    "yes",
+    "YES",
+):
     targets.append("127.0.0.1")
 
 # Remove duplicates while preserving order

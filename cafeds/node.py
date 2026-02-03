@@ -8,17 +8,33 @@ from dataclasses import dataclass
 from typing import Optional, Set, Dict, Any
 
 from .config import (
-    DISCOVERY_TARGETS, DISCOVERY_INTERVAL, HEARTBEAT_INTERVAL, LEADER_TIMEOUT,
-    LOG_PREFIX, DISCOVERY_PORT, NODE_UDP_BASE,
-    ELECTION_ANSWER_TIMEOUT, COORDINATOR_TIMEOUT, CLUSTER_NODE_IDS,
-    WAL_ENABLED, WAL_FILE, HEARTBEAT_REDUNDANCY
+    DISCOVERY_TARGETS,
+    DISCOVERY_INTERVAL,
+    HEARTBEAT_INTERVAL,
+    LEADER_TIMEOUT,
+    LOG_PREFIX,
+    DISCOVERY_PORT,
+    NODE_UDP_BASE,
+    ELECTION_ANSWER_TIMEOUT,
+    COORDINATOR_TIMEOUT,
+    CLUSTER_NODE_IDS,
+    WAL_ENABLED,
+    WAL_FILE,
+    HEARTBEAT_REDUNDANCY,
 )
 from .udp_bus import make_udp_socket, send_udp, recv_udp
 from .proto import (
-    encode, decode,
-    who_is_leader, i_am_leader, leader_alive,
-    election, answer, coordinator,
-    new_order, order_msg, resend_request
+    encode,
+    decode,
+    who_is_leader,
+    i_am_leader,
+    leader_alive,
+    election,
+    answer,
+    coordinator,
+    new_order,
+    order_msg,
+    resend_request,
 )
 from .tcp_server import TCPServer, ClientConn
 from .tcp_client import TCPClient
@@ -97,9 +113,11 @@ class Node:
         # leader heartbeat start guard
         self._heartbeat_started = False
 
-
     def log(self, msg: str) -> None:
-        print(f"{LOG_PREFIX} [id={self.node_id} role={self.role} udp_node={self.node_udp_port}] {msg}", flush=True)
+        print(
+            f"{LOG_PREFIX} [id={self.node_id} role={self.role} udp_node={self.node_udp_port}] {msg}",
+            flush=True,
+        )
 
     # ---------------- WAL (Write-Ahead Log) ----------------
 
@@ -259,12 +277,20 @@ class Node:
             if seq > self.expected_seq:
                 self.buffer[seq] = msg
                 now = time.time()
-                if self.tcp_client and self.tcp_connected and (now - self.last_resend_ts) >= 0.5:
+                if (
+                    self.tcp_client
+                    and self.tcp_connected
+                    and (now - self.last_resend_ts) >= 0.5
+                ):
                     self.last_resend_ts = now
                     try:
                         req = resend_request(self.expected_seq)
                     except Exception:
-                        req = {"type": "RESEND_REQUEST", "sender_id": self.node_id, "from_seq": self.expected_seq}
+                        req = {
+                            "type": "RESEND_REQUEST",
+                            "sender_id": self.node_id,
+                            "from_seq": self.expected_seq,
+                        }
                     try:
                         self.tcp_client.send(req)
                         self.log(f"RESEND_REQUEST sent from_seq={self.expected_seq}")
@@ -310,7 +336,9 @@ class Node:
                     if self._is_better_leader(new):
                         self.leader = new
                         self.epoch = max(self.epoch, new.epoch)
-                        self.log(f"Leader discovered: {new.leader_id} @ {new.leader_ip}:{new.leader_tcp_port} (epoch={new.epoch})")
+                        self.log(
+                            f"Leader discovered: {new.leader_id} @ {new.leader_ip}:{new.leader_tcp_port} (epoch={new.epoch})"
+                        )
 
                 elif mtype == "LEADER_ALIVE" and self.role == "follower":
                     lid = int(msg.get("leader_id", -1))
@@ -340,7 +368,12 @@ class Node:
                     e = int(msg.get("epoch", 1))
                     if self.node_id > cand:
                         try:
-                            send_udp(self.udp_node, encode(answer(self.node_id, max(self.epoch, e))), src_ip, src_port)
+                            send_udp(
+                                self.udp_node,
+                                encode(answer(self.node_id, max(self.epoch, e))),
+                                src_ip,
+                                src_port,
+                            )
                         except Exception:
                             pass
                         # higher node should also start its own election
@@ -358,16 +391,22 @@ class Node:
                     e = int(msg.get("epoch", 1))
 
                     # If I'm leader but see higher epoch coordinator, step down
-                    if self.role == "leader" and lead_id != self.node_id and e >= self.epoch:
+                    if (
+                        self.role == "leader"
+                        and lead_id != self.node_id
+                        and e >= self.epoch
+                    ):
                         self.log(f"Stepping down: coordinator {lead_id} epoch={e}")
-                        self._demote_to_follower(LeaderInfo(
-                            leader_id=lead_id,
-                            leader_ip=src_ip,  # real sender IP
-                            leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
-                            epoch=e,
-                            last_seq=int(msg.get("last_seq", 0)),
-                            last_seen_ts=time.time()
-                        ))
+                        self._demote_to_follower(
+                            LeaderInfo(
+                                leader_id=lead_id,
+                                leader_ip=src_ip,  # real sender IP
+                                leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
+                                epoch=e,
+                                last_seq=int(msg.get("last_seq", 0)),
+                                last_seen_ts=time.time(),
+                            )
+                        )
 
             except socket.timeout:
                 continue
@@ -456,11 +495,9 @@ class Node:
                         self.seen_order_uuids.add(order_uuid)
 
                 with self.history_lock:
-                    if order_uuid in self.seen_uuids:
-                        return
-                    self.seen_uuids.add(order_uuid)
-
-                    self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
+                    self.last_seq = max(
+                        self.last_seq, max(self.history.keys(), default=0)
+                    )
                     self.last_seq += 1
                     seq = self.last_seq
                     om = order_msg(
@@ -476,7 +513,6 @@ class Node:
                 # WAL: persist to disk BEFORE broadcasting (crash durability)
                 self._append_to_wal(om)
 
-                self.log(f"NEW_ORDER -> seq={seq} (broadcast ORDER)")
                 self._process_order(om)
                 assert self.tcp_server is not None
                 self.tcp_server.broadcast(om)
@@ -489,7 +525,9 @@ class Node:
                         if s in self.history:
                             conn.send(self.history[s])
 
-        self.tcp_server = TCPServer("0.0.0.0", self.tcp_port, on_msg=on_msg, on_log=self.log)
+        self.tcp_server = TCPServer(
+            "0.0.0.0", self.tcp_port, on_msg=on_msg, on_log=self.log
+        )
         self.tcp_server.start()
 
     def _start_leader_heartbeat_thread(self) -> None:
@@ -510,7 +548,7 @@ class Node:
                 self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
 
             hb = leader_alive(self.node_id, self.epoch, self.last_seq)
-            
+
             # Omission Fault Tolerance: send heartbeat multiple times
             # This reduces the chance of election due to dropped UDP packets
             for _ in range(HEARTBEAT_REDUNDANCY):
@@ -601,7 +639,7 @@ class Node:
                 om["sender_id"] = self.node_id
                 self.history[seq] = om
             self.log(f"LOCAL_ORDER -> seq={seq} (broadcast ORDER)")
-            self._process_order(om) 
+            self._process_order(om)
             if self.tcp_server:
                 self.tcp_server.broadcast(om)
             return
@@ -663,11 +701,13 @@ class Node:
             leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
             epoch=int(msg.get("epoch", proposed_epoch)),
             last_seq=int(msg.get("last_seq", 0)),
-            last_seen_ts=time.time()
+            last_seen_ts=time.time(),
         )
         self.epoch = max(self.epoch, lead.epoch)
         self.leader = lead
-        self.log(f"COORDINATOR is {lead.leader_id} @ {lead.leader_ip}:{lead.leader_tcp_port} epoch={lead.epoch}")
+        self.log(
+            f"COORDINATOR is {lead.leader_id} @ {lead.leader_ip}:{lead.leader_tcp_port} epoch={lead.epoch}"
+        )
 
         with self.election_lock:
             self.in_election = False
@@ -703,7 +743,9 @@ class Node:
                 self.expected_seq = max(self.expected_seq, self.last_seq + 1)
                 self.delivered_seqs.update(range(1, self.expected_seq))
 
-        msg = coordinator(self.node_id, primary_ip(), self.tcp_port, self.epoch, self.last_seq)
+        msg = coordinator(
+            self.node_id, primary_ip(), self.tcp_port, self.epoch, self.last_seq
+        )
         for nid in CLUSTER_NODE_IDS:
             if nid == self.node_id:
                 continue

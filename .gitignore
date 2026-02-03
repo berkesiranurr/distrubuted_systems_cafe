@@ -3,25 +3,32 @@
 venv/
 env/
 
-# Python cache
+# Python cache & build
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
 
-# Byte-compiled files
-*.pyc
-
-# Temporary files
+# Temporary & Backup files
 *.tmp
 *.bak
+*.bak_*
+*.swp
+*~
+.DS_Store
 
 # IDE
 .idea/
 .vscode/
-*.swp
 
-# Extracted text files (generated)
-*_text.txt
-
-# WAL (Write-Ahead Log) files
+# Project specific
 cafeds_wal_*.jsonl
+# Integration test WAL files
+tests/*.jsonl
+# Local trace/log files
+*.log
