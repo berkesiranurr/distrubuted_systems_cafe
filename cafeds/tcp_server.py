@@ -4,6 +4,7 @@ from typing import Dict, Any, Callable, List, Optional
 
 from .tcp_stream import send_json_line, read_json_lines
 
+
 class ClientConn:
     def __init__(self, sock: socket.socket, addr):
         self.sock = sock
@@ -22,7 +23,13 @@ class ClientConn:
 
 
 class TCPServer:
-    def __init__(self, host: str, port: int, on_msg: Callable[[ClientConn, Dict[str, Any]], None], on_log: Callable[[str], None]):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        on_msg: Callable[[ClientConn, Dict[str, Any]], None],
+        on_log: Callable[[str], None],
+    ):
         self.host = host
         self.port = port
         self.on_msg = on_msg
@@ -54,7 +61,9 @@ class TCPServer:
                     self.clients.append(conn)
                 self.on_log(f"TCP client connected: {addr}")
 
-                rt = threading.Thread(target=self._client_reader, args=(conn,), daemon=True)
+                rt = threading.Thread(
+                    target=self._client_reader, args=(conn,), daemon=True
+                )
                 rt.start()
             except Exception:
                 continue

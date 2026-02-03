@@ -1,6 +1,7 @@
 import socket
 from typing import List
 
+
 def primary_ip() -> str:
     """
     Best-effort: finds the IP of the default route interface.
@@ -16,9 +17,12 @@ def primary_ip() -> str:
     except Exception:
         pass
     finally:
-        try: s.close()
-        except Exception: pass
+        try:
+            s.close()
+        except Exception:
+            pass
     return "127.0.0.1"
+
 
 def local_ip_for_peer(peer_ip: str) -> str:
     """
@@ -34,9 +38,12 @@ def local_ip_for_peer(peer_ip: str) -> str:
     except Exception:
         pass
     finally:
-        try: s.close()
-        except Exception: pass
+        try:
+            s.close()
+        except Exception:
+            pass
     return primary_ip()
+
 
 def guess_directed_broadcast(ip: str) -> str:
     # simple /24 heuristic (enough for most campus/home LANs)
@@ -44,6 +51,7 @@ def guess_directed_broadcast(ip: str) -> str:
     if len(parts) == 4 and not ip.startswith("127."):
         return ".".join(parts[:3] + ["255"])
     return "255.255.255.255"
+
 
 def discovery_targets() -> List[str]:
     ip = primary_ip()

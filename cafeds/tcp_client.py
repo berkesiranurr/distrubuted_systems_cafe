@@ -4,8 +4,11 @@ from typing import Dict, Any, Callable, Optional
 
 from .tcp_stream import send_json_line, read_json_lines
 
+
 class TCPClient:
-    def __init__(self, on_msg: Callable[[Dict[str, Any]], None], on_log: Callable[[str], None]):
+    def __init__(
+        self, on_msg: Callable[[Dict[str, Any]], None], on_log: Callable[[str], None]
+    ):
         self.on_msg = on_msg
         self.on_log = on_log
 
