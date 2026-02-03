@@ -456,6 +456,10 @@ class Node:
                         self.seen_order_uuids.add(order_uuid)
 
                 with self.history_lock:
+                    if order_uuid in self.seen_uuids:
+                        return
+                    self.seen_uuids.add(order_uuid)
+
                     self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
                     self.last_seq += 1
                     seq = self.last_seq
@@ -473,7 +477,7 @@ class Node:
                 self._append_to_wal(om)
 
                 self.log(f"NEW_ORDER -> seq={seq} (broadcast ORDER)")
-                self._process_order(om) # これでキッチンに表示されます
+                self._process_order(om)
                 assert self.tcp_server is not None
                 self.tcp_server.broadcast(om)
 

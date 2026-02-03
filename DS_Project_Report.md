@@ -281,8 +281,6 @@ The kitchen queue must be **identical on all screens**. When two waiters submit 
 | Discovery Mechanism | ✅ Complete | UDP Broadcast |
 | Discovery Implementation | ✅ Complete | Client discovers server |
 | Discovery Timing | ✅ Complete | On startup + continuous |
-| Voting Algorithm | ✅ Complete | Bully Algorithm |
-| Group View | ✅ Complete | CLUSTER_NODE_IDS |
 | Node Identification | ✅ Complete | Integer node_id + UUID for orders |
 | Election Trigger | ✅ Complete | On leader failure |
 | Ordering Type | ✅ Complete | Total Ordering |
