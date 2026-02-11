@@ -143,6 +143,14 @@ class Node:
     ) -> None:
         """Register or update a dynamically discovered peer."""
         if node_id == self.node_id:
+            # DUPLICATE ID DETECTION: another node claims OUR id from a different IP
+            my_ip = primary_ip()
+            if ip not in (my_ip, "127.0.0.1", "0.0.0.0") and my_ip != "127.0.0.1":
+                self.log(
+                    f"⚠ DUPLICATE NODE ID DETECTED! Another node with id={node_id} "
+                    f"is running at {ip}. This WILL cause cluster instability. "
+                    f"Please use a unique --id for each node."
+                )
             return  # don't register self
         udp_port = NODE_UDP_BASE + node_id
         with self.peers_lock:
@@ -403,6 +411,7 @@ class Node:
 
             # seq == expected => deliver and flush
             self._deliver(msg)
+            self._append_to_wal(msg)  # persist to WAL on delivery
             self.delivered_seqs.add(seq)
             self.expected_seq += 1
 
@@ -413,6 +422,7 @@ class Node:
                     self.expected_seq += 1
                     continue
                 self._deliver(m2)
+                self._append_to_wal(m2)  # persist to WAL on delivery
                 self.delivered_seqs.add(s2)
                 self.expected_seq += 1
 
@@ -446,6 +456,9 @@ class Node:
                     )
 
                     if self._is_better_leader(new):
+                        # Reset TCP so we reconnect to the correct leader
+                        if self.leader and new.leader_id != self.leader.leader_id:
+                            self._close_tcp_client()
                         self.leader = new
                         self.epoch = max(self.epoch, new.epoch)
                         self.log(
@@ -521,12 +534,17 @@ class Node:
                     lead_id = int(msg.get("leader_id", -1))
                     e = int(msg.get("epoch", 1))
 
-                    # If I'm leader but see higher epoch coordinator, step down
-                    if (
+                    # If I'm leader but see a legitimate higher coordinator, step down.
+                    # Bully rule: higher epoch wins; at same epoch, higher ID wins.
+                    should_step_down = (
                         self.role == "leader"
                         and lead_id != self.node_id
-                        and e >= self.epoch
-                    ):
+                        and (
+                            e > self.epoch
+                            or (e == self.epoch and lead_id > self.node_id)
+                        )
+                    )
+                    if should_step_down:
                         self.log(f"Stepping down: coordinator {lead_id} epoch={e}")
                         self._demote_to_follower(
                             LeaderInfo(
@@ -538,6 +556,21 @@ class Node:
                                 last_seen_ts=time.time(),
                             )
                         )
+
+                    # As follower receiving COORDINATOR: reset TCP to reconnect to new leader
+                    if self.role == "follower":
+                        new_leader = LeaderInfo(
+                            leader_id=lead_id,
+                            leader_ip=src_ip,
+                            leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
+                            epoch=e,
+                            last_seq=int(msg.get("last_seq", 0)),
+                            last_seen_ts=time.time(),
+                        )
+                        if self.leader is None or lead_id != self.leader.leader_id:
+                            self._close_tcp_client()
+                        self.leader = new_leader
+                        self.epoch = max(self.epoch, e)
 
             except socket.timeout:
                 continue
@@ -903,6 +936,14 @@ class Node:
         if self.tcp_server:
             self.tcp_server.stop()
             self.tcp_server = None
+
+        # Release the discovery port so the new leader can bind it
+        if self.udp_disc:
+            try:
+                self.udp_disc.close()
+            except Exception:
+                pass
+            self.udp_disc = None
 
         self.role = "follower"
         self.leader = new_leader
