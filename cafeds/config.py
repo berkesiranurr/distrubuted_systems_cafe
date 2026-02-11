@@ -1,6 +1,8 @@
+import os
+
 # ---- Networking ----
-DISCOVERY_PORT = 37020
-NODE_UDP_BASE = 37100
+DISCOVERY_PORT = int(os.environ.get("CAFEDS_DISCOVERY_PORT", "37020"))
+NODE_UDP_BASE = int(os.environ.get("CAFEDS_NODE_UDP_BASE", "37100"))
 
 # ---- Timings ----
 DISCOVERY_INTERVAL = 1.0

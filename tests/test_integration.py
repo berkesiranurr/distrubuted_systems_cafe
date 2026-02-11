@@ -38,7 +38,7 @@ def test_distributed_cafe():
 
         # Wait for cluster to stabilize
         # (Startup probe takes 1s + discovery takes ~1s + margin)
-        time.sleep(5)
+        time.sleep(8)
 
         # Verify Node 10 is leader
         assert nodes[10].role == "leader"
@@ -91,8 +91,55 @@ def test_distributed_cafe():
     finally:
         for node in nodes.values():
             node.stop()
-        # Clean up WAL files
         for nid in node_ids:
+            wal = f"cafeds_wal_node_{nid}.jsonl"
+            if os.path.exists(wal):
+                os.remove(wal)
+
+
+def test_duplicate_leader_starts_as_follower():
+    """
+    Verify that if a node starts with role='leader' but a leader already exists,
+    it automatically demotes to 'follower'.
+    """
+    # 1. Start a legitimate leader (Node 10)
+    leader = Node(node_id=10, role="leader", tcp_port=8010, ui="kitchen")
+    # Start a late comer that THINKS it's a leader (Node 9)
+    # It has lower ID, so it should yield to 10 anyway, but we want to ensure
+    # it starts as a follower immediately upon detecting 10.
+    late_comer = Node(node_id=9, role="leader", tcp_port=8009, ui="kitchen")
+
+    nodes = [leader, late_comer]
+    threads = []
+    
+    try:
+        import threading
+        # Run leader first
+        t1 = threading.Thread(target=leader.run, daemon=True)
+        t1.start()
+        threads.append(t1)
+        
+        # Wait for leader to be established
+        time.sleep(3)
+        assert leader.role == "leader"
+
+        # Run late comer
+        t2 = threading.Thread(target=late_comer.run, daemon=True)
+        t2.start()
+        threads.append(t2)
+
+        # Wait for probe (1s) + startup
+        time.sleep(3)
+
+        # Verify late comer demoted itself
+        assert late_comer.role == "follower", "Node 9 should have demoted to follower"
+        assert late_comer.leader is not None
+        assert late_comer.leader.leader_id == 10
+
+    finally:
+        for n in nodes:
+            n.stop()
+        for nid in [9, 10]:
             wal = f"cafeds_wal_node_{nid}.jsonl"
             if os.path.exists(wal):
                 os.remove(wal)

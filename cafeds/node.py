@@ -246,6 +246,19 @@ class Node:
         if not self._check_id_available():
             return  # ID already in use, refuse to start
 
+        # ---- Existing Leader Check: if we are leader, check if another leader exists ----
+        if self.role == "leader":
+            if self._check_existing_leader():
+                self.log("⚠ WARNING: Another LEADER is already active. Demoting to FOLLOWER.")
+                self.role = "follower"
+                # If we had a discovery socket for leader role, close it
+                if self.udp_disc:
+                    try:
+                        self.udp_disc.close()
+                    except Exception:
+                        pass
+                    self.udp_disc = None
+
         t1 = threading.Thread(target=self._udp_node_listener, daemon=True)
         t1.start()
         self.threads.add(t1)
@@ -323,6 +336,51 @@ class Node:
         self.udp_node.settimeout(old_timeout)
         self.log(f"Node ID {self.node_id} is available. Proceeding.")
         return True
+
+    def _check_existing_leader(self) -> bool:
+        """Probe the network to see if a leader already exists.
+
+        Returns True if a leader is found, False otherwise.
+        """
+        # We need a temporary socket for this probe since we might not have udp_disc yet
+        # or we want to keep it separate from the main listener.
+        # Actually, we can use self.udp_node for sending/receiving.
+
+        token = str(uuid.uuid4())
+        probe = encode(who_is_leader(self.node_id, self.tcp_port))
+
+        # Send probe to all discovery targets on DISCOVERY_PORT
+        for ip in discovery_targets():
+            try:
+                send_udp(self.udp_node, probe, ip, DISCOVERY_PORT)
+            except Exception:
+                pass
+
+        # Listen for I_AM_LEADER responses (1 second window)
+        self.log("Checking for existing leader...")
+        old_timeout = self.udp_node.gettimeout()
+        self.udp_node.settimeout(0.3)
+        deadline = time.time() + 1.0
+
+        found_leader = False
+        while time.time() < deadline:
+            try:
+                data, (src_ip, _) = self.udp_node.recvfrom(4096)
+                msg = decode(data)
+                if msg.get("type") == "I_AM_LEADER":
+                    lid = msg.get("leader_id")
+                    lip = msg.get("leader_ip")
+                    self.log(f"DEBUG: I_AM_LEADER received from {lid} @ {src_ip} (claim ip={lip}). I am {self.node_id}.")
+                    self.log(f"Found existing leader: {lid} @ {src_ip}")
+                    found_leader = True
+                    break
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+        self.udp_node.settimeout(old_timeout)
+        return found_leader
 
     # ---------------- UDP HELPERS ----------------
 
