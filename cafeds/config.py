@@ -27,4 +27,4 @@ HEARTBEAT_REDUNDANCY = 2
 
 # ---- Peer expiry ----
 # How long (seconds) before an unseen peer is removed from the registry
-PEER_EXPIRY = 10.0
+PEER_EXPIRY = 5.0

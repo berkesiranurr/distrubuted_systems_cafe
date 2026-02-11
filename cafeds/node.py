@@ -759,6 +759,10 @@ class Node:
             # leader timeout?
             if self.leader and (now - self.leader.last_seen_ts) > LEADER_TIMEOUT:
                 self._close_tcp_client()
+                # Remove failed leader from peer registry so we don't try to elect it
+                failed_id = self.leader.leader_id
+                with self.peers_lock:
+                    self.peers.pop(failed_id, None)
                 self.leader = None
                 self._safe_start_election("Leader timeout")
 
@@ -967,6 +971,9 @@ class Node:
         self.answer_event.clear()
         self.coordinator_event.clear()
         self.coordinator_msg = None
+
+        # Clean up any stale peers before computing 'higher' set
+        self._prune_peers()
 
         proposed_epoch = self.epoch + 1
         # Dynamic: get higher-ID peers from registry
