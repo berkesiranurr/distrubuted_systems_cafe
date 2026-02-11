@@ -35,7 +35,10 @@ def i_am_leader(
 
 
 def leader_alive(
-    leader_id: int, epoch: int, last_seq: int, leader_tcp_port: int,
+    leader_id: int,
+    epoch: int,
+    last_seq: int,
+    leader_tcp_port: int,
     cluster: list = None,
 ) -> Dict[str, Any]:
     msg = {
@@ -62,9 +65,7 @@ def election(candidate_id: int, epoch: int, candidate_tcp_port: int) -> Dict[str
     }
 
 
-def answer(
-    responder_id: int, epoch: int, responder_tcp_port: int
-) -> Dict[str, Any]:
+def answer(responder_id: int, epoch: int, responder_tcp_port: int) -> Dict[str, Any]:
     return {
         "type": "ANSWER",
         "responder_id": responder_id,

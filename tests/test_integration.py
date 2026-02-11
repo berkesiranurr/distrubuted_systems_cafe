@@ -111,14 +111,15 @@ def test_duplicate_leader_starts_as_follower():
 
     nodes = [leader, late_comer]
     threads = []
-    
+
     try:
         import threading
+
         # Run leader first
         t1 = threading.Thread(target=leader.run, daemon=True)
         t1.start()
         threads.append(t1)
-        
+
         # Wait for leader to be established
         time.sleep(3)
         assert leader.role == "leader"

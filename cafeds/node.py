@@ -39,7 +39,6 @@ from .tcp_server import TCPServer, ClientConn
 from .tcp_client import TCPClient
 from .net import primary_ip, local_ip_for_peer, discovery_targets
 
-
 # --------------- Dynamic Peer Registry ---------------
 
 
@@ -77,7 +76,9 @@ class Node:
             # Disable reuse_addr to prevent local duplicates (OS will block bind)
             self.udp_node = make_udp_socket(self.node_udp_port, reuse_addr=False)
         except OSError:
-            print(f"CRITICAL: Port {self.node_udp_port} is already in use. Is node {node_id} running?")
+            print(
+                f"CRITICAL: Port {self.node_udp_port} is already in use. Is node {node_id} running?"
+            )
             raise
 
         self.udp_disc: Optional[socket.socket] = None
@@ -143,9 +144,7 @@ class Node:
 
     # ---------------- Dynamic Peer Registry ----------------
 
-    def _register_peer(
-        self, node_id: int, ip: str, tcp_port: int = 0
-    ) -> None:
+    def _register_peer(self, node_id: int, ip: str, tcp_port: int = 0) -> None:
         """Register or update a dynamically discovered peer."""
         if node_id == self.node_id:
             # DUPLICATE ID DETECTION: another node claims OUR id from a different IP
@@ -174,7 +173,9 @@ class Node:
                     tcp_port=tcp_port,
                     last_seen=time.time(),
                 )
-                self.log(f"Peer discovered: id={node_id} ip={ip} udp={udp_port} tcp={tcp_port}")
+                self.log(
+                    f"Peer discovered: id={node_id} ip={ip} udp={udp_port} tcp={tcp_port}"
+                )
 
     def _get_peer_ids(self) -> list:
         """Return list of known peer IDs (excluding self)."""
@@ -249,7 +250,9 @@ class Node:
         # ---- Existing Leader Check: if we are leader, check if another leader exists ----
         if self.role == "leader":
             if self._check_existing_leader():
-                self.log("⚠ WARNING: Another LEADER is already active. Demoting to FOLLOWER.")
+                self.log(
+                    "⚠ WARNING: Another LEADER is already active. Demoting to FOLLOWER."
+                )
                 self.role = "follower"
                 # If we had a discovery socket for leader role, close it
                 if self.udp_disc:
@@ -293,11 +296,13 @@ class Node:
         Returns True if the ID is available, False if taken.
         """
         token = str(uuid.uuid4())
-        probe = encode({
-            "type": "ID_CHECK",
-            "node_id": self.node_id,
-            "token": token,
-        })
+        probe = encode(
+            {
+                "type": "ID_CHECK",
+                "node_id": self.node_id,
+                "token": token,
+            }
+        )
 
         # Send probe to all discovery targets on our own UDP port
         for ip in discovery_targets():
@@ -370,7 +375,9 @@ class Node:
                 if msg.get("type") == "I_AM_LEADER":
                     lid = msg.get("leader_id")
                     lip = msg.get("leader_ip")
-                    self.log(f"DEBUG: I_AM_LEADER received from {lid} @ {src_ip} (claim ip={lip}). I am {self.node_id}.")
+                    self.log(
+                        f"DEBUG: I_AM_LEADER received from {lid} @ {src_ip} (claim ip={lip}). I am {self.node_id}."
+                    )
                     self.log(f"Found existing leader: {lid} @ {src_ip}")
                     found_leader = True
                     break
@@ -555,8 +562,19 @@ class Node:
                 mtype = msg.get("type")
 
                 # --- Register peer from any incoming message ---
-                sender_id = msg.get("sender_id") or msg.get("leader_id") or msg.get("candidate_id") or msg.get("responder_id")
-                sender_tcp = msg.get("sender_tcp_port") or msg.get("leader_tcp_port") or msg.get("candidate_tcp_port") or msg.get("responder_tcp_port") or 0
+                sender_id = (
+                    msg.get("sender_id")
+                    or msg.get("leader_id")
+                    or msg.get("candidate_id")
+                    or msg.get("responder_id")
+                )
+                sender_tcp = (
+                    msg.get("sender_tcp_port")
+                    or msg.get("leader_tcp_port")
+                    or msg.get("candidate_tcp_port")
+                    or msg.get("responder_tcp_port")
+                    or 0
+                )
                 if sender_id is not None:
                     try:
                         self._register_peer(int(sender_id), src_ip, int(sender_tcp))
@@ -632,7 +650,11 @@ class Node:
                         try:
                             send_udp(
                                 self.udp_node,
-                                encode(answer(self.node_id, max(self.epoch, e), self.tcp_port)),
+                                encode(
+                                    answer(
+                                        self.node_id, max(self.epoch, e), self.tcp_port
+                                    )
+                                ),
                                 src_ip,
                                 src_port,
                             )
@@ -646,11 +668,13 @@ class Node:
                     check_id = msg.get("node_id")
                     check_token = msg.get("token")
                     if check_id == self.node_id and check_token:
-                        reply = encode({
-                            "type": "ID_TAKEN",
-                            "node_id": self.node_id,
-                            "token": check_token,
-                        })
+                        reply = encode(
+                            {
+                                "type": "ID_TAKEN",
+                                "node_id": self.node_id,
+                                "token": check_token,
+                            }
+                        )
                         try:
                             send_udp(self.udp_node, reply, src_ip, src_port)
                         except Exception:
@@ -858,9 +882,17 @@ class Node:
             cluster_list = []
             with self.peers_lock:
                 for pid, pinfo in self.peers.items():
-                    cluster_list.append({"id": pid, "ip": pinfo.ip, "tcp": pinfo.tcp_port})
+                    cluster_list.append(
+                        {"id": pid, "ip": pinfo.ip, "tcp": pinfo.tcp_port}
+                    )
 
-            hb = leader_alive(self.node_id, self.epoch, self.last_seq, self.tcp_port, cluster=cluster_list)
+            hb = leader_alive(
+                self.node_id,
+                self.epoch,
+                self.last_seq,
+                self.tcp_port,
+                cluster=cluster_list,
+            )
 
             # Omission Fault Tolerance: send heartbeat multiple times
             # This reduces the chance of election due to dropped UDP packets
@@ -982,7 +1014,9 @@ class Node:
 
         for nid in higher:
             try:
-                self._send_to_node(nid, election(self.node_id, proposed_epoch, self.tcp_port))
+                self._send_to_node(
+                    nid, election(self.node_id, proposed_epoch, self.tcp_port)
+                )
             except Exception:
                 pass
 
