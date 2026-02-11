@@ -5,7 +5,6 @@ os.environ["CAFEDS_SINGLE_PC"] = "1"
 import time
 import pytest
 from cafeds.node import Node
-from cafeds.config import CLUSTER_NODE_IDS
 
 
 @pytest.fixture(autouse=True)
@@ -15,8 +14,9 @@ def setup_env():
 
 def test_distributed_cafe():
     # 1. Start nodes
-    # We use CLUSTER_NODE_IDS = [2, 3, 10]
+    # Node IDs can be any unique integers — dynamic discovery finds them
     # Node 10 (highest ID) will naturally become leader in Bully algorithm
+    node_ids = [2, 3, 10]
     nodes = {}
 
     # Leader (Node 10)
@@ -91,7 +91,7 @@ def test_distributed_cafe():
         for node in nodes.values():
             node.stop()
         # Clean up WAL files
-        for nid in CLUSTER_NODE_IDS:
+        for nid in node_ids:
             wal = f"cafeds_wal_node_{nid}.jsonl"
             if os.path.exists(wal):
                 os.remove(wal)
