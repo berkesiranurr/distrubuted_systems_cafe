@@ -73,7 +73,12 @@ class Node:
 
         # UDP sockets
         self.node_udp_port = NODE_UDP_BASE + node_id
-        self.udp_node = make_udp_socket(self.node_udp_port)
+        try:
+            # Disable reuse_addr to prevent local duplicates (OS will block bind)
+            self.udp_node = make_udp_socket(self.node_udp_port, reuse_addr=False)
+        except OSError:
+            print(f"CRITICAL: Port {self.node_udp_port} is already in use. Is node {node_id} running?")
+            raise
 
         self.udp_disc: Optional[socket.socket] = None
         if role == "leader":
@@ -237,6 +242,10 @@ class Node:
     # ---------------- RUN ----------------
 
     def run(self) -> None:
+        # ---- Duplicate ID check: probe the network before starting ----
+        if not self._check_id_available():
+            return  # ID already in use, refuse to start
+
         t1 = threading.Thread(target=self._udp_node_listener, daemon=True)
         t1.start()
         self.threads.add(t1)
@@ -263,6 +272,57 @@ class Node:
         self.log("Node is running.")
         while not self.stop_event.is_set():
             time.sleep(0.5)
+
+    def _check_id_available(self) -> bool:
+        """Probe the network to see if our node ID is already in use.
+
+        Sends an ID_CHECK message and waits for ID_TAKEN replies.
+        Returns True if the ID is available, False if taken.
+        """
+        token = str(uuid.uuid4())
+        probe = encode({
+            "type": "ID_CHECK",
+            "node_id": self.node_id,
+            "token": token,
+        })
+
+        # Send probe to all discovery targets on our own UDP port
+        for ip in discovery_targets():
+            try:
+                send_udp(self.udp_node, probe, ip, self.node_udp_port)
+            except Exception:
+                pass
+
+        # Listen for ID_TAKEN responses (1 second window is enough for LAN)
+        self.log(f"Checking if node ID {self.node_id} is available on the network...")
+        old_timeout = self.udp_node.gettimeout()
+        self.udp_node.settimeout(0.3)
+        deadline = time.time() + 1.0
+
+        while time.time() < deadline:
+            try:
+                data, (src_ip, _) = self.udp_node.recvfrom(4096)
+                msg = decode(data)
+                if (
+                    msg.get("type") == "ID_TAKEN"
+                    and msg.get("token") == token
+                    and msg.get("node_id") == self.node_id
+                ):
+                    self.log(
+                        f"\u274c ERROR: Node ID {self.node_id} is already in use "
+                        f"by {src_ip}. Cannot start. "
+                        f"Please choose a different --id."
+                    )
+                    self.udp_node.settimeout(old_timeout)
+                    return False
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+        self.udp_node.settimeout(old_timeout)
+        self.log(f"Node ID {self.node_id} is available. Proceeding.")
+        return True
 
     # ---------------- UDP HELPERS ----------------
 
@@ -522,6 +582,21 @@ class Node:
                             pass
                         # higher node should also start its own election
                         self._safe_start_election("Received ELECTION from lower node")
+
+                elif mtype == "ID_CHECK":
+                    # Another node is probing to see if our ID is taken
+                    check_id = msg.get("node_id")
+                    check_token = msg.get("token")
+                    if check_id == self.node_id and check_token:
+                        reply = encode({
+                            "type": "ID_TAKEN",
+                            "node_id": self.node_id,
+                            "token": check_token,
+                        })
+                        try:
+                            send_udp(self.udp_node, reply, src_ip, src_port)
+                        except Exception:
+                            pass
 
                 elif mtype == "ANSWER":
                     self.answer_event.set()

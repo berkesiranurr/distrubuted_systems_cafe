@@ -37,7 +37,8 @@ def test_distributed_cafe():
             threads.append(t)
 
         # Wait for cluster to stabilize
-        time.sleep(3)
+        # (Startup probe takes 1s + discovery takes ~1s + margin)
+        time.sleep(5)
 
         # Verify Node 10 is leader
         assert nodes[10].role == "leader"
