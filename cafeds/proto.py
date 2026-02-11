@@ -34,24 +34,44 @@ def i_am_leader(
     }
 
 
-def leader_alive(leader_id: int, epoch: int, last_seq: int) -> Dict[str, Any]:
-    return {
+def leader_alive(
+    leader_id: int,
+    epoch: int,
+    last_seq: int,
+    leader_tcp_port: int,
+    cluster: list = None,
+) -> Dict[str, Any]:
+    msg = {
         "type": "LEADER_ALIVE",
         "leader_id": leader_id,
         "epoch": epoch,
         "last_seq": last_seq,
+        "leader_tcp_port": leader_tcp_port,
     }
+    if cluster:
+        msg["cluster"] = cluster
+    return msg
 
 
 # ---------------- UDP election (Bully) ----------------
 
 
-def election(candidate_id: int, epoch: int) -> Dict[str, Any]:
-    return {"type": "ELECTION", "candidate_id": candidate_id, "epoch": epoch}
+def election(candidate_id: int, epoch: int, candidate_tcp_port: int) -> Dict[str, Any]:
+    return {
+        "type": "ELECTION",
+        "candidate_id": candidate_id,
+        "epoch": epoch,
+        "candidate_tcp_port": candidate_tcp_port,
+    }
 
 
-def answer(responder_id: int, epoch: int) -> Dict[str, Any]:
-    return {"type": "ANSWER", "responder_id": responder_id, "epoch": epoch}
+def answer(responder_id: int, epoch: int, responder_tcp_port: int) -> Dict[str, Any]:
+    return {
+        "type": "ANSWER",
+        "responder_id": responder_id,
+        "epoch": epoch,
+        "responder_tcp_port": responder_tcp_port,
+    }
 
 
 def coordinator(

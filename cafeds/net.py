@@ -1,3 +1,4 @@
+import os
 import socket
 from typing import List
 
@@ -53,13 +54,42 @@ def guess_directed_broadcast(ip: str) -> str:
     return "255.255.255.255"
 
 
+def _is_single_pc_mode() -> bool:
+    """Check if CAFEDS_SINGLE_PC env var is set."""
+    return os.environ.get("CAFEDS_SINGLE_PC", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def discovery_targets() -> List[str]:
+    """
+    Build the list of IPs to send discovery / heartbeat broadcasts to.
+
+    Multi-PC (default):
+      - LAN /24 broadcast + global broadcast
+      - 127.0.0.1 is EXCLUDED (prevents 'leader=127.0.0.1' self-connect bugs)
+
+    Single-PC test (CAFEDS_SINGLE_PC=1):
+      - Adds 127.0.0.1 so that nodes on the same machine can find each other
+    """
     ip = primary_ip()
-    targets = ["127.0.0.1", "255.255.255.255"]
+    targets: List[str] = []
+
+    # LAN /24 broadcast if we have a real LAN IP
     if not ip.startswith("127."):
         targets.append(guess_directed_broadcast(ip))
-    # unique preserve order
-    out = []
+
+    # global broadcast
+    targets.append("255.255.255.255")
+
+    # single-PC mode: add localhost so 3-terminal demo works
+    if _is_single_pc_mode():
+        targets.append("127.0.0.1")
+
+    # deduplicate, preserve order
+    out: List[str] = []
     for x in targets:
         if x not in out:
             out.append(x)

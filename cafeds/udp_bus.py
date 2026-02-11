@@ -2,9 +2,10 @@ import socket
 from typing import Tuple
 
 
-def make_udp_socket(port: int) -> socket.socket:
+def make_udp_socket(port: int, reuse_addr: bool = True) -> socket.socket:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if reuse_addr:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # broadcast enable (needed for 255.255.255.255)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     s.bind(("", port))

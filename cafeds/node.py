@@ -4,11 +4,10 @@ import socket
 import uuid
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Set, Dict, Any
 
 from .config import (
-    DISCOVERY_TARGETS,
     DISCOVERY_INTERVAL,
     HEARTBEAT_INTERVAL,
     LEADER_TIMEOUT,
@@ -17,10 +16,10 @@ from .config import (
     NODE_UDP_BASE,
     ELECTION_ANSWER_TIMEOUT,
     COORDINATOR_TIMEOUT,
-    CLUSTER_NODE_IDS,
     WAL_ENABLED,
     WAL_FILE,
     HEARTBEAT_REDUNDANCY,
+    PEER_EXPIRY,
 )
 from .udp_bus import make_udp_socket, send_udp, recv_udp
 from .proto import (
@@ -39,6 +38,19 @@ from .proto import (
 from .tcp_server import TCPServer, ClientConn
 from .tcp_client import TCPClient
 from .net import primary_ip, local_ip_for_peer, discovery_targets
+
+# --------------- Dynamic Peer Registry ---------------
+
+
+@dataclass
+class PeerInfo:
+    """Represents a dynamically discovered peer node."""
+
+    node_id: int
+    ip: str
+    udp_port: int
+    tcp_port: int
+    last_seen: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -60,7 +72,14 @@ class Node:
 
         # UDP sockets
         self.node_udp_port = NODE_UDP_BASE + node_id
-        self.udp_node = make_udp_socket(self.node_udp_port)
+        try:
+            # Disable reuse_addr to prevent local duplicates (OS will block bind)
+            self.udp_node = make_udp_socket(self.node_udp_port, reuse_addr=False)
+        except OSError:
+            print(
+                f"CRITICAL: Port {self.node_udp_port} is already in use. Is node {node_id} running?"
+            )
+            raise
 
         self.udp_disc: Optional[socket.socket] = None
         if role == "leader":
@@ -86,7 +105,7 @@ class Node:
         # Total-order delivery (follower)
         self.expected_seq = 1
         self.buffer: Dict[int, Dict[str, Any]] = {}
-        self.delivered_seqs = set()
+        self.delivered_seqs: Set[int] = set()
         self.delivery_lock = threading.Lock()
         self.last_resend_ts = 0.0
 
@@ -113,11 +132,68 @@ class Node:
         # leader heartbeat start guard
         self._heartbeat_started = False
 
+        # ---- Dynamic Peer Registry ----
+        self.peers: Dict[int, PeerInfo] = {}
+        self.peers_lock = threading.Lock()
+
     def log(self, msg: str) -> None:
         print(
             f"{LOG_PREFIX} [id={self.node_id} role={self.role} udp_node={self.node_udp_port}] {msg}",
             flush=True,
         )
+
+    # ---------------- Dynamic Peer Registry ----------------
+
+    def _register_peer(self, node_id: int, ip: str, tcp_port: int = 0) -> None:
+        """Register or update a dynamically discovered peer."""
+        if node_id == self.node_id:
+            # DUPLICATE ID DETECTION: another node claims OUR id from a different IP
+            my_ip = primary_ip()
+            if ip not in (my_ip, "127.0.0.1", "0.0.0.0") and my_ip != "127.0.0.1":
+                self.log(
+                    f"⚠ DUPLICATE NODE ID DETECTED! Another node with id={node_id} "
+                    f"is running at {ip}. This WILL cause cluster instability. "
+                    f"Please use a unique --id for each node."
+                )
+            return  # don't register self
+        udp_port = NODE_UDP_BASE + node_id
+        with self.peers_lock:
+            existing = self.peers.get(node_id)
+            if existing:
+                existing.ip = ip
+                existing.udp_port = udp_port
+                if tcp_port:
+                    existing.tcp_port = tcp_port
+                existing.last_seen = time.time()
+            else:
+                self.peers[node_id] = PeerInfo(
+                    node_id=node_id,
+                    ip=ip,
+                    udp_port=udp_port,
+                    tcp_port=tcp_port,
+                    last_seen=time.time(),
+                )
+                self.log(
+                    f"Peer discovered: id={node_id} ip={ip} udp={udp_port} tcp={tcp_port}"
+                )
+
+    def _get_peer_ids(self) -> list:
+        """Return list of known peer IDs (excluding self)."""
+        with self.peers_lock:
+            return [pid for pid in self.peers if pid != self.node_id]
+
+    def _prune_peers(self) -> None:
+        """Remove peers not seen for PEER_EXPIRY seconds."""
+        now = time.time()
+        with self.peers_lock:
+            expired = [
+                pid
+                for pid, p in self.peers.items()
+                if (now - p.last_seen) > PEER_EXPIRY
+            ]
+            for pid in expired:
+                del self.peers[pid]
+                # (logging removed to avoid spam)
 
     # ---------------- WAL (Write-Ahead Log) ----------------
 
@@ -167,6 +243,25 @@ class Node:
     # ---------------- RUN ----------------
 
     def run(self) -> None:
+        # ---- Duplicate ID check: probe the network before starting ----
+        if not self._check_id_available():
+            return  # ID already in use, refuse to start
+
+        # ---- Existing Leader Check: if we are leader, check if another leader exists ----
+        if self.role == "leader":
+            if self._check_existing_leader():
+                self.log(
+                    "⚠ WARNING: Another LEADER is already active. Demoting to FOLLOWER."
+                )
+                self.role = "follower"
+                # If we had a discovery socket for leader role, close it
+                if self.udp_disc:
+                    try:
+                        self.udp_disc.close()
+                    except Exception:
+                        pass
+                    self.udp_disc = None
+
         t1 = threading.Thread(target=self._udp_node_listener, daemon=True)
         t1.start()
         self.threads.add(t1)
@@ -194,14 +289,155 @@ class Node:
         while not self.stop_event.is_set():
             time.sleep(0.5)
 
+    def _check_id_available(self) -> bool:
+        """Probe the network to see if our node ID is already in use.
+
+        Sends an ID_CHECK message and waits for ID_TAKEN replies.
+        Returns True if the ID is available, False if taken.
+        """
+        token = str(uuid.uuid4())
+        probe = encode(
+            {
+                "type": "ID_CHECK",
+                "node_id": self.node_id,
+                "token": token,
+            }
+        )
+
+        # Send probe to all discovery targets on our own UDP port
+        for ip in discovery_targets():
+            try:
+                send_udp(self.udp_node, probe, ip, self.node_udp_port)
+            except Exception:
+                pass
+
+        # Listen for ID_TAKEN responses (1 second window is enough for LAN)
+        self.log(f"Checking if node ID {self.node_id} is available on the network...")
+        old_timeout = self.udp_node.gettimeout()
+        self.udp_node.settimeout(0.3)
+        deadline = time.time() + 1.0
+
+        while time.time() < deadline:
+            try:
+                data, (src_ip, _) = self.udp_node.recvfrom(4096)
+                msg = decode(data)
+                if (
+                    msg.get("type") == "ID_TAKEN"
+                    and msg.get("token") == token
+                    and msg.get("node_id") == self.node_id
+                ):
+                    self.log(
+                        f"\u274c ERROR: Node ID {self.node_id} is already in use "
+                        f"by {src_ip}. Cannot start. "
+                        f"Please choose a different --id."
+                    )
+                    self.udp_node.settimeout(old_timeout)
+                    return False
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+        self.udp_node.settimeout(old_timeout)
+        self.log(f"Node ID {self.node_id} is available. Proceeding.")
+        return True
+
+    def _check_existing_leader(self) -> bool:
+        """Probe the network to see if a leader already exists.
+
+        Returns True if a leader is found, False otherwise.
+        """
+        # We need a temporary socket for this probe since we might not have udp_disc yet
+        # or we want to keep it separate from the main listener.
+        # Actually, we can use self.udp_node for sending/receiving.
+
+        token = str(uuid.uuid4())
+        probe = encode(who_is_leader(self.node_id, self.tcp_port))
+
+        # Send probe to all discovery targets on DISCOVERY_PORT
+        for ip in discovery_targets():
+            try:
+                send_udp(self.udp_node, probe, ip, DISCOVERY_PORT)
+            except Exception:
+                pass
+
+        # Listen for I_AM_LEADER responses (1 second window)
+        self.log("Checking for existing leader...")
+        old_timeout = self.udp_node.gettimeout()
+        self.udp_node.settimeout(0.3)
+        deadline = time.time() + 1.0
+
+        found_leader = False
+        while time.time() < deadline:
+            try:
+                data, (src_ip, _) = self.udp_node.recvfrom(4096)
+                msg = decode(data)
+                if msg.get("type") == "I_AM_LEADER":
+                    lid = msg.get("leader_id")
+                    lip = msg.get("leader_ip")
+                    self.log(
+                        f"DEBUG: I_AM_LEADER received from {lid} @ {src_ip} (claim ip={lip}). I am {self.node_id}."
+                    )
+                    self.log(f"Found existing leader: {lid} @ {src_ip}")
+                    found_leader = True
+                    break
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+        self.udp_node.settimeout(old_timeout)
+        return found_leader
+
     # ---------------- UDP HELPERS ----------------
 
     def _port_of(self, node_id: int) -> int:
         return NODE_UDP_BASE + node_id
 
     def _send_to_node(self, target_id: int, msg: Dict[str, Any]) -> None:
+        """Send a UDP message to a specific node.
+
+        If we know the peer's IP from the registry, send directly.
+        Otherwise fall back to broadcast so that unknown peers can still be reached.
+        """
         payload = encode(msg)
         port = self._port_of(target_id)
+
+        with self.peers_lock:
+            peer = self.peers.get(target_id)
+
+        if peer and not peer.ip.startswith("0."):
+            # Send directly to known peer IP
+            try:
+                send_udp(self.udp_node, payload, peer.ip, port)
+            except Exception:
+                pass
+            return
+
+        # Fallback: broadcast to all discovery targets
+        for ip in discovery_targets():
+            try:
+                send_udp(self.udp_node, payload, ip, port)
+            except Exception:
+                pass
+
+    def _broadcast_to_all_peers(self, msg: Dict[str, Any]) -> None:
+        """Send a UDP message to ALL known peers (used for heartbeats, coordinator)."""
+        payload = encode(msg)
+        peer_ids = self._get_peer_ids()
+        for pid in peer_ids:
+            port = self._port_of(pid)
+            with self.peers_lock:
+                peer = self.peers.get(pid)
+            if peer:
+                try:
+                    send_udp(self.udp_node, payload, peer.ip, port)
+                except Exception:
+                    pass
+
+    def _broadcast_to_discovery(self, msg: Dict[str, Any], port: int) -> None:
+        """Broadcast a message via discovery targets (for reaching unknown nodes)."""
+        payload = encode(msg)
         for ip in discovery_targets():
             try:
                 send_udp(self.udp_node, payload, ip, port)
@@ -300,6 +536,7 @@ class Node:
 
             # seq == expected => deliver and flush
             self._deliver(msg)
+            self._append_to_wal(msg)  # persist to WAL on delivery
             self.delivered_seqs.add(seq)
             self.expected_seq += 1
 
@@ -310,6 +547,7 @@ class Node:
                     self.expected_seq += 1
                     continue
                 self._deliver(m2)
+                self._append_to_wal(m2)  # persist to WAL on delivery
                 self.delivered_seqs.add(s2)
                 self.expected_seq += 1
 
@@ -323,10 +561,30 @@ class Node:
                 msg = decode(data)
                 mtype = msg.get("type")
 
+                # --- Register peer from any incoming message ---
+                sender_id = (
+                    msg.get("sender_id")
+                    or msg.get("leader_id")
+                    or msg.get("candidate_id")
+                    or msg.get("responder_id")
+                )
+                sender_tcp = (
+                    msg.get("sender_tcp_port")
+                    or msg.get("leader_tcp_port")
+                    or msg.get("candidate_tcp_port")
+                    or msg.get("responder_tcp_port")
+                    or 0
+                )
+                if sender_id is not None:
+                    try:
+                        self._register_peer(int(sender_id), src_ip, int(sender_tcp))
+                    except (ValueError, TypeError):
+                        pass
+
                 if mtype == "I_AM_LEADER" and self.role == "follower":
                     new = LeaderInfo(
                         leader_id=int(msg.get("leader_id", -1)),
-                        leader_ip=src_ip,  # IMPORTANT: use real sender IP (multi-PC safe)
+                        leader_ip=src_ip,  # use real sender IP (multi-PC safe)
                         leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
                         epoch=int(msg.get("epoch", 1)),
                         last_seq=int(msg.get("last_seq", 0)),
@@ -334,6 +592,9 @@ class Node:
                     )
 
                     if self._is_better_leader(new):
+                        # Reset TCP so we reconnect to the correct leader
+                        if self.leader and new.leader_id != self.leader.leader_id:
+                            self._close_tcp_client()
                         self.leader = new
                         self.epoch = max(self.epoch, new.epoch)
                         self.log(
@@ -344,13 +605,14 @@ class Node:
                     lid = int(msg.get("leader_id", -1))
                     e = int(msg.get("epoch", 1))
                     ls = int(msg.get("last_seq", 0))
+                    ltcp = int(msg.get("leader_tcp_port", 0))
 
-                    # If leader unknown, accept heartbeat as "someone exists" (tcp_port unknown yet)
+                    # If leader unknown, accept heartbeat as "someone exists"
                     if self.leader is None:
                         self.leader = LeaderInfo(
                             leader_id=lid,
                             leader_ip=src_ip,
-                            leader_tcp_port=0,
+                            leader_tcp_port=ltcp,
                             epoch=e,
                             last_seq=ls,
                             last_seen_ts=time.time(),
@@ -361,7 +623,25 @@ class Node:
                             self.leader.last_seen_ts = time.time()
                             self.leader.epoch = max(self.leader.epoch, e)
                             self.leader.last_seq = max(self.leader.last_seq, ls)
+                            # Update leader IP to currently seen src_ip
+                            # (handles IP changes / reconnects)
+                            self.leader.leader_ip = src_ip
+                            if ltcp:
+                                self.leader.leader_tcp_port = ltcp
                     self.epoch = max(self.epoch, e)
+
+                    # Register sibling peers from leader's cluster list
+                    # This allows followers to know about each other for elections
+                    cluster = msg.get("cluster", [])
+                    for peer_entry in cluster:
+                        try:
+                            pid = int(peer_entry.get("id", 0))
+                            pip = str(peer_entry.get("ip", ""))
+                            ptcp = int(peer_entry.get("tcp", 0))
+                            if pid and pip:
+                                self._register_peer(pid, pip, ptcp)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
 
                 if mtype == "ELECTION":
                     cand = int(msg.get("candidate_id", -1))
@@ -370,7 +650,11 @@ class Node:
                         try:
                             send_udp(
                                 self.udp_node,
-                                encode(answer(self.node_id, max(self.epoch, e))),
+                                encode(
+                                    answer(
+                                        self.node_id, max(self.epoch, e), self.tcp_port
+                                    )
+                                ),
                                 src_ip,
                                 src_port,
                             )
@@ -378,6 +662,23 @@ class Node:
                             pass
                         # higher node should also start its own election
                         self._safe_start_election("Received ELECTION from lower node")
+
+                elif mtype == "ID_CHECK":
+                    # Another node is probing to see if our ID is taken
+                    check_id = msg.get("node_id")
+                    check_token = msg.get("token")
+                    if check_id == self.node_id and check_token:
+                        reply = encode(
+                            {
+                                "type": "ID_TAKEN",
+                                "node_id": self.node_id,
+                                "token": check_token,
+                            }
+                        )
+                        try:
+                            send_udp(self.udp_node, reply, src_ip, src_port)
+                        except Exception:
+                            pass
 
                 elif mtype == "ANSWER":
                     self.answer_event.set()
@@ -390,12 +691,17 @@ class Node:
                     lead_id = int(msg.get("leader_id", -1))
                     e = int(msg.get("epoch", 1))
 
-                    # If I'm leader but see higher epoch coordinator, step down
-                    if (
+                    # If I'm leader but see a legitimate higher coordinator, step down.
+                    # Bully rule: higher epoch wins; at same epoch, higher ID wins.
+                    should_step_down = (
                         self.role == "leader"
                         and lead_id != self.node_id
-                        and e >= self.epoch
-                    ):
+                        and (
+                            e > self.epoch
+                            or (e == self.epoch and lead_id > self.node_id)
+                        )
+                    )
+                    if should_step_down:
                         self.log(f"Stepping down: coordinator {lead_id} epoch={e}")
                         self._demote_to_follower(
                             LeaderInfo(
@@ -407,6 +713,21 @@ class Node:
                                 last_seen_ts=time.time(),
                             )
                         )
+
+                    # As follower receiving COORDINATOR: reset TCP to reconnect to new leader
+                    if self.role == "follower":
+                        new_leader = LeaderInfo(
+                            leader_id=lead_id,
+                            leader_ip=src_ip,
+                            leader_tcp_port=int(msg.get("leader_tcp_port", 0)),
+                            epoch=e,
+                            last_seq=int(msg.get("last_seq", 0)),
+                            last_seen_ts=time.time(),
+                        )
+                        if self.leader is None or lead_id != self.leader.leader_id:
+                            self._close_tcp_client()
+                        self.leader = new_leader
+                        self.epoch = max(self.epoch, e)
 
             except socket.timeout:
                 continue
@@ -424,6 +745,15 @@ class Node:
                 data, (src_ip, src_port) = recv_udp(self.udp_disc)
                 msg = decode(data)
                 if msg.get("type") == "WHO_IS_LEADER" and self.role == "leader":
+                    # Register the querying peer
+                    sid = msg.get("sender_id")
+                    stcp = msg.get("sender_tcp_port", 0)
+                    if sid is not None:
+                        try:
+                            self._register_peer(int(sid), src_ip, int(stcp))
+                        except (ValueError, TypeError):
+                            pass
+
                     reply = i_am_leader(
                         leader_id=self.node_id,
                         leader_ip=local_ip_for_peer(src_ip),
@@ -453,6 +783,10 @@ class Node:
             # leader timeout?
             if self.leader and (now - self.leader.last_seen_ts) > LEADER_TIMEOUT:
                 self._close_tcp_client()
+                # Remove failed leader from peer registry so we don't try to elect it
+                failed_id = self.leader.leader_id
+                with self.peers_lock:
+                    self.peers.pop(failed_id, None)
                 self.leader = None
                 self._safe_start_election("Leader timeout")
 
@@ -460,7 +794,7 @@ class Node:
             if self.leader is None and not self.in_election:
                 q = who_is_leader(self.node_id, self.tcp_port)
                 payload = encode(q)
-                for ip in DISCOVERY_TARGETS:
+                for ip in discovery_targets():
                     try:
                         send_udp(self.udp_node, payload, ip, DISCOVERY_PORT)
                     except Exception:
@@ -469,6 +803,9 @@ class Node:
             # If leader known but TCP not connected: connect
             if self.leader is not None:
                 self._ensure_tcp_connected()
+
+            # Periodic peer pruning
+            self._prune_peers()
 
             time.sleep(DISCOVERY_INTERVAL)
 
@@ -541,18 +878,27 @@ class Node:
             with self.history_lock:
                 self.last_seq = max(self.last_seq, max(self.history.keys(), default=0))
 
-            hb = leader_alive(self.node_id, self.epoch, self.last_seq)
+            # Build cluster peer list for heartbeat so followers learn about each other
+            cluster_list = []
+            with self.peers_lock:
+                for pid, pinfo in self.peers.items():
+                    cluster_list.append(
+                        {"id": pid, "ip": pinfo.ip, "tcp": pinfo.tcp_port}
+                    )
+
+            hb = leader_alive(
+                self.node_id,
+                self.epoch,
+                self.last_seq,
+                self.tcp_port,
+                cluster=cluster_list,
+            )
 
             # Omission Fault Tolerance: send heartbeat multiple times
             # This reduces the chance of election due to dropped UDP packets
             for _ in range(HEARTBEAT_REDUNDANCY):
-                for nid in CLUSTER_NODE_IDS:
-                    if nid == self.node_id:
-                        continue
-                    try:
-                        self._send_to_node(nid, hb)
-                    except Exception:
-                        pass
+                # Send to all known peers directly
+                self._broadcast_to_all_peers(hb)
 
             time.sleep(HEARTBEAT_INTERVAL)
 
@@ -658,15 +1004,25 @@ class Node:
         self.coordinator_event.clear()
         self.coordinator_msg = None
 
+        # Clean up any stale peers before computing 'higher' set
+        self._prune_peers()
+
         proposed_epoch = self.epoch + 1
-        higher = [nid for nid in CLUSTER_NODE_IDS if nid > self.node_id]
+        # Dynamic: get higher-ID peers from registry
+        higher = [pid for pid in self._get_peer_ids() if pid > self.node_id]
         self.log(f"Election started. higher={higher}")
 
         for nid in higher:
             try:
-                self._send_to_node(nid, election(self.node_id, proposed_epoch))
+                self._send_to_node(
+                    nid, election(self.node_id, proposed_epoch, self.tcp_port)
+                )
             except Exception:
                 pass
+
+        # If we don't know any higher peers, we are the highest known — promote directly
+        if not higher:
+            self.log("No known higher peers; promoting self.")
 
         got_answer = self.answer_event.wait(ELECTION_ANSWER_TIMEOUT)
 
@@ -737,16 +1093,12 @@ class Node:
                 self.expected_seq = max(self.expected_seq, self.last_seq + 1)
                 self.delivered_seqs.update(range(1, self.expected_seq))
 
-        msg = coordinator(
+        coord_msg = coordinator(
             self.node_id, primary_ip(), self.tcp_port, self.epoch, self.last_seq
         )
-        for nid in CLUSTER_NODE_IDS:
-            if nid == self.node_id:
-                continue
-            try:
-                self._send_to_node(nid, msg)
-            except Exception:
-                pass
+
+        # Send COORDINATOR to all known peers
+        self._broadcast_to_all_peers(coord_msg)
 
         self.log(f"Announced COORDINATOR epoch={self.epoch} last_seq={self.last_seq}")
 
@@ -758,6 +1110,14 @@ class Node:
         if self.tcp_server:
             self.tcp_server.stop()
             self.tcp_server = None
+
+        # Release the discovery port so the new leader can bind it
+        if self.udp_disc:
+            try:
+                self.udp_disc.close()
+            except Exception:
+                pass
+            self.udp_disc = None
 
         self.role = "follower"
         self.leader = new_leader

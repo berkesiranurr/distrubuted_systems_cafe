@@ -15,12 +15,14 @@ def main():
 
     args = ap.parse_args()
 
-    node = Node(node_id=args.id, role=args.role, tcp_port=args.tcp_port, ui=args.ui)
-
     try:
+        node = Node(node_id=args.id, role=args.role, tcp_port=args.tcp_port, ui=args.ui)
         node.run()
         while True:
             time.sleep(0.5)
+    except OSError:
+        # Already logged "CRITICAL: Port ... in use" in Node.__init__
+        exit(1)
     except KeyboardInterrupt:
         print("\nStopping...")
         node.stop()

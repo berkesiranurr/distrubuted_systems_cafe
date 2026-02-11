@@ -5,7 +5,6 @@ os.environ["CAFEDS_SINGLE_PC"] = "1"
 import time
 import pytest
 from cafeds.node import Node
-from cafeds.config import CLUSTER_NODE_IDS
 
 
 @pytest.fixture(autouse=True)
@@ -15,8 +14,9 @@ def setup_env():
 
 def test_distributed_cafe():
     # 1. Start nodes
-    # We use CLUSTER_NODE_IDS = [2, 3, 10]
+    # Node IDs can be any unique integers — dynamic discovery finds them
     # Node 10 (highest ID) will naturally become leader in Bully algorithm
+    node_ids = [2, 3, 10]
     nodes = {}
 
     # Leader (Node 10)
@@ -37,7 +37,8 @@ def test_distributed_cafe():
             threads.append(t)
 
         # Wait for cluster to stabilize
-        time.sleep(3)
+        # (Startup probe takes 1s + discovery takes ~1s + margin)
+        time.sleep(8)
 
         # Verify Node 10 is leader
         assert nodes[10].role == "leader"
@@ -90,8 +91,56 @@ def test_distributed_cafe():
     finally:
         for node in nodes.values():
             node.stop()
-        # Clean up WAL files
-        for nid in CLUSTER_NODE_IDS:
+        for nid in node_ids:
+            wal = f"cafeds_wal_node_{nid}.jsonl"
+            if os.path.exists(wal):
+                os.remove(wal)
+
+
+def test_duplicate_leader_starts_as_follower():
+    """
+    Verify that if a node starts with role='leader' but a leader already exists,
+    it automatically demotes to 'follower'.
+    """
+    # 1. Start a legitimate leader (Node 10)
+    leader = Node(node_id=10, role="leader", tcp_port=8010, ui="kitchen")
+    # Start a late comer that THINKS it's a leader (Node 9)
+    # It has lower ID, so it should yield to 10 anyway, but we want to ensure
+    # it starts as a follower immediately upon detecting 10.
+    late_comer = Node(node_id=9, role="leader", tcp_port=8009, ui="kitchen")
+
+    nodes = [leader, late_comer]
+    threads = []
+
+    try:
+        import threading
+
+        # Run leader first
+        t1 = threading.Thread(target=leader.run, daemon=True)
+        t1.start()
+        threads.append(t1)
+
+        # Wait for leader to be established
+        time.sleep(3)
+        assert leader.role == "leader"
+
+        # Run late comer
+        t2 = threading.Thread(target=late_comer.run, daemon=True)
+        t2.start()
+        threads.append(t2)
+
+        # Wait for probe (1s) + startup
+        time.sleep(3)
+
+        # Verify late comer demoted itself
+        assert late_comer.role == "follower", "Node 9 should have demoted to follower"
+        assert late_comer.leader is not None
+        assert late_comer.leader.leader_id == 10
+
+    finally:
+        for n in nodes:
+            n.stop()
+        for nid in [9, 10]:
             wal = f"cafeds_wal_node_{nid}.jsonl"
             if os.path.exists(wal):
                 os.remove(wal)
